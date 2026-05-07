@@ -1169,3 +1169,154 @@ macro_rules! impl_setup_hello_totp {
         ))
     }};
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use himmelblau::error::{
+        AADSTSError, ErrorResponse, MsalError, INVALID_CRED, NO_CONSENT, REQUIRES_MFA,
+    };
+
+    fn unwrap_broker(e: IdpError) -> (u32, u32, String, String) {
+        match e {
+            IdpError::BrokerAuthFailure {
+                status,
+                sub_status,
+                category,
+                description,
+            } => (status, sub_status, category, description),
+            other => panic!("expected BrokerAuthFailure, got {:?}", other),
+        }
+    }
+
+    fn assert_bad_request(e: IdpError) {
+        match e {
+            IdpError::BadRequest => (),
+            other => panic!("expected BadRequest, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn aadsts_mfa_required_yields_subcode_50076() {
+        let resp = ErrorResponse {
+            error: "interaction_required".to_string(),
+            error_description: "AADSTS50076: Due to a configuration change, MFA is required.".to_string(),
+            error_codes: vec![50076, REQUIRES_MFA],
+        };
+        let (status, sub_status, category, description) =
+            unwrap_broker(msal_error_to_broker_auth_failure(MsalError::AcquireTokenFailed(resp)));
+        assert_eq!(status, REQUIRES_MFA, "status should be REQUIRES_MFA when error_codes contains it");
+        assert_eq!(sub_status, 50076, "sub_status should be the first AADSTS code");
+        assert_eq!(category, "AcquireTokenFailed:interaction_required");
+        assert!(description.starts_with("AADSTS50076"), "description should preserve AAD message, got: {}", description);
+    }
+
+    #[test]
+    fn consent_required_yields_no_consent_status() {
+        let resp = ErrorResponse {
+            error: "consent_required".to_string(),
+            error_description: "AADSTS65001: The user or administrator has not consented.".to_string(),
+            error_codes: vec![65001, NO_CONSENT],
+        };
+        let (status, sub_status, _, _) =
+            unwrap_broker(msal_error_to_broker_auth_failure(MsalError::AcquireTokenFailed(resp)));
+        assert_eq!(status, NO_CONSENT);
+        assert_eq!(sub_status, 65001);
+    }
+
+    #[test]
+    fn invalid_cred_yields_invalid_cred_status() {
+        let resp = ErrorResponse {
+            error: "invalid_grant".to_string(),
+            error_description: "AADSTS50126: bad password".to_string(),
+            error_codes: vec![50126, INVALID_CRED],
+        };
+        let (status, sub_status, _, _) =
+            unwrap_broker(msal_error_to_broker_auth_failure(MsalError::AcquireTokenFailed(resp)));
+        assert_eq!(status, INVALID_CRED);
+        assert_eq!(sub_status, 50126);
+    }
+
+    #[test]
+    fn unknown_acquire_token_failure_keeps_aadsts_subcode_status_zero() {
+        let resp = ErrorResponse {
+            error: "invalid_request".to_string(),
+            error_description: "AADSTS900971: bogus".to_string(),
+            error_codes: vec![900971],
+        };
+        let (status, sub_status, _, _) =
+            unwrap_broker(msal_error_to_broker_auth_failure(MsalError::AcquireTokenFailed(resp)));
+        assert_eq!(status, 0, "status falls back to 0 when error_codes carries no recognized libhimmelblau constant");
+        assert_eq!(sub_status, 900971, "sub_status should still carry the AADSTS code");
+    }
+
+    #[test]
+    fn empty_error_codes_yields_zero_status_zero_substatus() {
+        let resp = ErrorResponse {
+            error: "server_error".to_string(),
+            error_description: "blank".to_string(),
+            error_codes: vec![],
+        };
+        let (status, sub_status, _, _) =
+            unwrap_broker(msal_error_to_broker_auth_failure(MsalError::AcquireTokenFailed(resp)));
+        assert_eq!(status, 0);
+        assert_eq!(sub_status, 0);
+    }
+
+    #[test]
+    fn aadsts_error_variant_uses_code_directly() {
+        let aadsts = AADSTSError::new(50076, None);
+        let (status, sub_status, category, _) =
+            unwrap_broker(msal_error_to_broker_auth_failure(MsalError::AADSTSError(aadsts)));
+        assert_eq!(status, 0, "status is 0 for direct AADSTSError; sub_status carries the code");
+        assert_eq!(sub_status, 50076);
+        assert_eq!(category, "AADSTSError");
+    }
+
+    #[test]
+    fn request_failed_sanitizes_raw_string() {
+        let raw = "https://login.microsoftonline.com/72f988bf-86f1-41af-91ab-2d7cd011db47/oauth2/token: connection reset (correlation_id=abcd-1234)".to_string();
+        let (status, sub_status, category, description) =
+            unwrap_broker(msal_error_to_broker_auth_failure(MsalError::RequestFailed(raw)));
+        assert_eq!(status, 0);
+        assert_eq!(sub_status, 0);
+        assert_eq!(category, "RequestFailed");
+        assert!(
+            !description.contains("login.microsoftonline.com"),
+            "raw URL must not leak across D-Bus, got: {}",
+            description
+        );
+        assert!(
+            !description.contains("correlation_id"),
+            "correlation IDs must not leak, got: {}",
+            description
+        );
+        assert!(
+            !description.contains("72f988bf"),
+            "tenant GUIDs must not leak, got: {}",
+            description
+        );
+    }
+
+    #[test]
+    fn other_msal_variants_preserve_bad_request_semantics() {
+        // CryptoFail / TPMFail / ConfigError / etc. must not become
+        // BrokerAuthFailure since the resolver state machine in other
+        // call paths depends on the coarse BadRequest variant.
+        assert_bad_request(msal_error_to_broker_auth_failure(MsalError::TPMFail(
+            "key handle missing".to_string(),
+        )));
+        assert_bad_request(msal_error_to_broker_auth_failure(MsalError::CryptoFail(
+            "rsa sign".to_string(),
+        )));
+        assert_bad_request(msal_error_to_broker_auth_failure(MsalError::ConfigError(
+            "bad cfg".to_string(),
+        )));
+        assert_bad_request(msal_error_to_broker_auth_failure(MsalError::InvalidJson(
+            "bad".to_string(),
+        )));
+        assert_bad_request(msal_error_to_broker_auth_failure(
+            MsalError::AuthTypeUnsupported,
+        ));
+    }
+}
