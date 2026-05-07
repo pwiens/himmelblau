@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use himmelblau_unix_common::idprovider::himmelblau::HimmelblauMultiProvider;
-use himmelblau_unix_common::idprovider::interface::Id;
+use himmelblau_unix_common::idprovider::interface::{Id, IdpError};
 use himmelblau_unix_common::resolver::Resolver;
 use identity_dbus_broker::HimmelblauBroker;
 use libc::uid_t;
@@ -160,9 +160,9 @@ impl HimmelblauBroker for Broker {
             None => None,
         };
         let req_cnf = build_req_cnf(&request.auth_parameters.pop_params);
-        let token = self
+        let token = match self
             .cachelayer
-            .get_user_accesstoken(
+            .get_user_accesstoken_with_error(
                 Id::Name(user.spn.clone()),
                 request.auth_parameters.requested_scopes,
                 request.auth_parameters.client_id,
@@ -170,7 +170,33 @@ impl HimmelblauBroker for Broker {
                 req_cnf,
             )
             .await
-            .ok_or("Failed to authenticate user")?;
+        {
+            Ok(token) => token,
+            Err(IdpError::BrokerAuthFailure {
+                status,
+                sub_status,
+                category,
+                description,
+            }) => {
+                // Forward the rich auth failure as a normal D-Bus response
+                // payload so clients see populated `error.{status, subStatus,
+                // context}` fields, matching the proprietary Intune broker's
+                // wire shape. Other IdpError variants keep returning Err
+                // below so identity_dbus_broker's existing generic envelope
+                // (status=0, subStatus=0) is preserved for non-auth failures.
+                let res = json!({
+                    "brokerTokenResponse": {
+                        "error": {
+                            "status": status,
+                            "subStatus": sub_status,
+                            "context": format!("{}: {}", category, description),
+                        }
+                    }
+                });
+                return Ok(res.to_string());
+            }
+            Err(_) => return Err("Failed to authenticate user".into()),
+        };
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|e| format!("{:?}", e))?;

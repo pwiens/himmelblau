@@ -603,20 +603,62 @@ where
         redirect_uri: Option<String>,
         req_cnf: Option<String>,
     ) -> Option<UnixUserToken> {
+        // Thin Option-returning wrapper preserved for legacy callers
+        // (daemon.rs Intune-policy / logon-script / profile-photo paths).
+        // The broker D-Bus path uses `get_user_accesstoken_with_error`
+        // to forward rich AAD/MSAL errors to clients.
+        self.get_user_accesstoken_with_error(
+            account_id,
+            scopes,
+            client_id,
+            redirect_uri,
+            req_cnf,
+        )
+        .await
+        .ok()
+    }
+
+    /// Result-returning sibling of [`Resolver::get_user_accesstoken`] used
+    /// by the broker D-Bus layer to forward rich AAD/MSAL errors to clients
+    /// via the `BrokerTokenResponse.error.{status, subStatus, context}`
+    /// envelope expected by Intune-broker-compatible clients.
+    ///
+    /// Most failure paths still return [`IdpError::BadRequest`] /
+    /// [`IdpError::NotFound`] so the resolver state machine elsewhere is
+    /// unchanged. Only access-token failures originating from AAD or the
+    /// transport layer surface as [`IdpError::BrokerAuthFailure`].
+    pub async fn get_user_accesstoken_with_error(
+        &self,
+        account_id: Id,
+        scopes: Vec<String>,
+        client_id: Option<String>,
+        redirect_uri: Option<String>,
+        req_cnf: Option<String>,
+    ) -> Result<UnixUserToken, IdpError> {
         // Validate the user isn't in the nxset (aka, it's a local user or group).
         let (name, idnumber) = match account_id.clone() {
             Id::Name(name) => (Some(name), None),
             Id::Gid(idnumber) => (None, Some(idnumber)),
         };
         if self.check_nxset(name.as_deref(), idnumber).await {
-            return None;
+            return Err(IdpError::NotFound {
+                what: "user".to_string(),
+                where_: "nxset".to_string(),
+            });
         }
 
         let token = match self.get_usertoken(account_id.clone()).await {
             Ok(Some(token)) => token,
-            _ => {
+            Ok(None) => {
                 error!("Failed to fetch unix user token during access token request!");
-                return None;
+                return Err(IdpError::NotFound {
+                    what: "user".to_string(),
+                    where_: "usertoken_cache".to_string(),
+                });
+            }
+            Err(()) => {
+                error!("Failed to fetch unix user token during access token request!");
+                return Err(IdpError::BadRequest);
             }
         };
 
@@ -641,14 +683,14 @@ where
         drop(hsm_lock);
         if dbtxn.commit().is_err() {
             error!("Failed to commit user token DB transaction");
-            return None;
+            return Err(IdpError::BadRequest);
         }
 
         match user_get_result {
-            Ok(token) => Some(token),
+            Ok(token) => Ok(token),
             Err(e) => {
                 error!("Failed to fetch access token: {:?}", e);
-                None
+                Err(e)
             }
         }
     }

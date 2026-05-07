@@ -45,6 +45,30 @@ pub enum IdpError {
     KeyStore,
     /// The idp failed to interact with the configured TPM
     Tpm,
+    /// Detailed authentication failure carrying provider-specific context
+    /// suitable for forwarding to clients via the broker D-Bus envelope.
+    /// Distinct from `BadRequest` / `Transport` so the broker can build a
+    /// rich `BrokerTokenResponse.error.{status, subStatus, context}` payload
+    /// matching the shape clients expect from the proprietary Intune broker.
+    /// Other resolver/PAM/cache paths must continue to use the coarse
+    /// variants above so the resolver state machine is unchanged.
+    BrokerAuthFailure {
+        /// libhimmelblau-domain broker auth status
+        /// (e.g. `INVALID_CRED`, `REQUIRES_MFA`, `NO_CONSENT`, or 0 if unknown).
+        /// Maps to `BrokerTokenResponse.error.status` over D-Bus.
+        status: u32,
+        /// AADSTS code if available, otherwise 0.
+        /// Maps to `BrokerTokenResponse.error.subStatus` over D-Bus.
+        sub_status: u32,
+        /// Stable, short category name (e.g. `"AcquireTokenFailed"`,
+        /// `"AADSTSError"`, `"RequestFailed"`). Useful for client-side
+        /// dispatch and logging without parsing free-form text.
+        category: String,
+        /// Description suitable for display. For `RequestFailed` this is a
+        /// sanitized stable string; raw transport details stay in the
+        /// daemon journal log only. Maps to `BrokerTokenResponse.error.context`.
+        description: String,
+    },
 }
 
 #[derive(Debug, Clone)]

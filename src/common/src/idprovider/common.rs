@@ -16,6 +16,9 @@
    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 use crate::idprovider::interface::IdpError;
+use himmelblau::error::{
+    MsalError, INVALID_CRED, NO_CONSENT, NO_GROUP_CONSENT, NO_SECRET, REQUIRES_MFA,
+};
 use kanidm_hsm_crypto::structures::SealedData;
 use serde::{Deserialize, Serialize};
 use std::thread::sleep;
@@ -24,10 +27,87 @@ use std::{
     time::{Duration, SystemTime},
 };
 use tokio::sync::RwLock;
+use tracing::error;
 
 /// When a cached PRT is older than 4h, opportunistically issue an
 /// `exchange_prt_for_prt` before using it for access-token acquisition.
 pub const PRT_REFRESH_AGE: Duration = Duration::from_secs(4 * 3600);
+
+/// Convert an MSAL error from the access-token acquisition path into a rich
+/// [`IdpError::BrokerAuthFailure`] suitable for forwarding over the broker
+/// D-Bus envelope (`brokerTokenResponse.error.{status, subStatus, context}`).
+///
+/// Only the variants that originate from AAD or the transport layer are
+/// promoted to `BrokerAuthFailure`. Anything else falls back to
+/// [`IdpError::BadRequest`] to preserve resolver state-machine semantics.
+///
+/// This helper must only be used on the broker silent/interactive token
+/// acquisition path. Other code paths (PAM auth, group resolution, profile
+/// photo fetches, etc.) should keep their existing coarse error mapping —
+/// `BrokerAuthFailure` carries D-Bus envelope semantics that those paths
+/// don't want.
+///
+/// Note: for [`MsalError::RequestFailed`] the raw string is intentionally
+/// dropped; raw transport error text can include URLs, tenant GUIDs,
+/// hostnames or correlation IDs we don't want to leak across the D-Bus
+/// boundary. The full message is still emitted to the daemon journal via
+/// the caller's `error!` log.
+pub fn msal_error_to_broker_auth_failure(e: MsalError) -> IdpError {
+    match e {
+        MsalError::AcquireTokenFailed(err_resp) => {
+            let sub_status = err_resp.error_codes.first().copied().unwrap_or(0);
+            // Pick a libhimmelblau-domain status from the error_codes set if
+            // we can recognize one. Falls back to 0 (unknown) so clients
+            // can rely on subStatus as the AADSTS code regardless.
+            let status = if err_resp.error_codes.contains(&NO_CONSENT)
+                || err_resp.error_codes.contains(&NO_GROUP_CONSENT)
+            {
+                NO_CONSENT
+            } else if err_resp.error_codes.contains(&REQUIRES_MFA) {
+                REQUIRES_MFA
+            } else if err_resp.error_codes.contains(&INVALID_CRED) {
+                INVALID_CRED
+            } else if err_resp.error_codes.contains(&NO_SECRET) {
+                NO_SECRET
+            } else {
+                0
+            };
+            IdpError::BrokerAuthFailure {
+                status,
+                sub_status,
+                category: format!("AcquireTokenFailed:{}", err_resp.error),
+                description: err_resp.error_description,
+            }
+        }
+        MsalError::AADSTSError(aadsts) => IdpError::BrokerAuthFailure {
+            status: 0,
+            sub_status: aadsts.code,
+            category: "AADSTSError".to_string(),
+            description: aadsts.to_string(),
+        },
+        MsalError::RequestFailed(raw) => {
+            // The raw message can contain hostnames / correlation IDs.
+            // Log it server-side, hand back a sanitized description.
+            error!("RequestFailed during broker token acquisition: {}", raw);
+            IdpError::BrokerAuthFailure {
+                status: 0,
+                sub_status: 0,
+                category: "RequestFailed".to_string(),
+                description:
+                    "Authentication failed: unable to reach authentication server."
+                        .to_string(),
+            }
+        }
+        // For other MsalError variants, keep the coarse `BadRequest`
+        // semantics so resolver/PAM behavior elsewhere is unchanged.
+        // The caller's existing `error!("{:?}", e)` log preserves the
+        // diagnostic info in journald.
+        other => {
+            error!("Unmapped MsalError on broker token path: {:?}", other);
+            IdpError::BadRequest
+        }
+    }
+}
 
 /// Build a `reqwest::Client` for `attempt_online()` probes.
 ///
@@ -701,7 +781,7 @@ macro_rules! entra_id_prt_token_fetch {
             .await
             .map_err(|e| {
                 error!("{:?}", e);
-                IdpError::BadRequest
+                $crate::idprovider::common::msal_error_to_broker_auth_failure(e)
             })
     }};
 }
@@ -751,7 +831,7 @@ macro_rules! entra_id_refresh_token_token_fetch {
             .await
             .map_err(|e| {
                 error!("Failed to refresh token: {:?}", e);
-                IdpError::BadRequest
+                $crate::idprovider::common::msal_error_to_broker_auth_failure(e)
             })
     }};
 }
