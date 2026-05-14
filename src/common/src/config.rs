@@ -1110,9 +1110,34 @@ mod tests {
         let temp_file = create_temp_config(config_data);
         let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
 
-        assert_eq!(config.get_apply_policy(), false);
+        assert_eq!(config.get_apply_policy(None), false);
+        // No domain override falls through to the global value.
+        assert_eq!(config.get_apply_policy(Some("example.com")), false);
         let config_empty = create_empty_config();
-        assert_eq!(config_empty.get_apply_policy(), true);
+        assert_eq!(config_empty.get_apply_policy(None), true);
+        assert_eq!(config_empty.get_apply_policy(Some("example.com")), true);
+    }
+
+    #[test]
+    fn test_get_apply_policy_domain_override() {
+        // Per-domain value MUST take precedence over the global default.
+        let config_data = r#"
+        [global]
+        apply_policy = true
+
+        [secondary.example]
+        apply_policy = false
+        "#;
+
+        let temp_file = create_temp_config(config_data);
+        let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
+
+        // Primary tenant inherits the global value.
+        assert_eq!(config.get_apply_policy(Some("primary.example")), true);
+        // Secondary tenant overrides to false.
+        assert_eq!(config.get_apply_policy(Some("secondary.example")), false);
+        // No domain context falls back to global.
+        assert_eq!(config.get_apply_policy(None), true);
     }
 
     #[test]

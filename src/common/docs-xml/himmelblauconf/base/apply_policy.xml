@@ -4,12 +4,14 @@
            type="bool"
            rust_type="bool"
            documented="true"
-           domain_specific="false"
+           domain_specific="true"
            order="3100">
 <description>
 A boolean option that enables the application and enforcement of Intune device compliance policies during non-OIDC authentication.
 When enabled (the default), non-compliant devices may be denied authentication in accordance with the configured policies.
 This setting does not affect OIDC-based authentication flows.
+
+When set in a per-domain section (for example, .B [example.com]), the value applies only to authentication and device-enrolment requests for that domain. The global value (or the documented default) is used as a fallback for any domain without an explicit override. This allows hosts that bridge multiple tenants to enforce Intune compliance for the primary tenant while skipping Intune enrolment in secondary tenants that do not have Intune for Linux configured.
 </description>
 <default>true</default>
 <example>apply_policy = false</example>

@@ -310,7 +310,8 @@ fn exercise_config(cfg: &HimmelblauConfig) {
     // Global, no panics expected
     let _ = cfg.get_debug();
     let _ = cfg.get_selinux();
-    let _ = cfg.get_apply_policy();
+    let _ = cfg.get_apply_policy(None);
+    let _ = cfg.get_apply_policy(Some("fuzz.example"));
     let _ = cfg.get_enable_hello();
     let _ = cfg.get_enable_sfa_fallback();
     let _ = cfg.get_enable_experimental_mfa();

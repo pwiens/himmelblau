@@ -1713,7 +1713,8 @@ impl IdProvider for HimmelblauProvider {
         let hello_enabled = self.config.lock().await.get_enable_hello();
         let hello_pin_retry_count = self.config.lock().await.get_hello_pin_retry_count();
         let intune_enrollment_required =
-            self.config.lock().await.get_apply_policy() && !self.is_intune_enrolled(keystore).await;
+            self.config.lock().await.get_apply_policy(Some(&self.domain))
+                && !self.is_intune_enrolled(keystore).await;
         if !self.is_domain_joined(keystore).await
             || hello_key.is_none()
             || !hello_enabled
@@ -5070,7 +5071,7 @@ impl HimmelblauProvider {
         machine_key: &tpm::structures::StorageKey,
     ) -> Result<(LoadableMsDeviceEnrolmentKey, String), IdpError> {
         // Enrolling the device in Intune
-        let apply_policy = self.config.lock().await.get_apply_policy();
+        let apply_policy = self.config.lock().await.get_apply_policy(Some(&self.domain));
         if apply_policy {
             let graph_token = match self
                 .client

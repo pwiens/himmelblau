@@ -577,10 +577,12 @@ async fn handle_client(
                                                     }
 
                                                     // Apply Intune policies
-                                                    if cfg.get_apply_policy()
+                                                    let account_domain = split_username(&account_id)
+                                                        .map(|(_, domain)| domain.to_string());
+                                                    if cfg.get_apply_policy(account_domain.as_deref())
                                                     {
-                                                        let intune_device_id = split_username(&account_id)
-                                                            .map(|(_, domain)| domain)
+                                                        let intune_device_id = account_domain
+                                                            .as_deref()
                                                             .and_then(|domain| {
                                                                 // The intune_device_id may have been written after startup,
                                                                 // so we re-read the config here.
