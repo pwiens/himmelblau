@@ -80,6 +80,8 @@ pub struct Resolver<I>
 where
     I: IdProvider + Sync,
 {
+    /// Shared by every broker connection; never exported with PRT persistence.
+    pub broker_access_tokens: crate::access_token_cache::AccessTokenCache,
     // Generic / modular types.
     db: Db,
     hsm: Mutex<BoxedDynTpm>,
@@ -743,6 +745,7 @@ where
         // We assume we are offline at start up, and we mark the next "online check" as
         // being valid from "now".
         Ok(Resolver {
+            broker_access_tokens: Default::default(),
             db,
             hsm,
             machine_key,
@@ -788,6 +791,7 @@ where
     }
 
     pub async fn clear_cache(&self) -> ResolverResult<()> {
+        let _fence = crate::access_token_cache::Invalidation::new();
         let mut nxcache_txn = self.nxcache.lock().await;
         nxcache_txn.clear();
         let mut dbtxn = self.db.write().await;
@@ -806,6 +810,7 @@ where
     }
 
     pub async fn invalidate(&self) -> ResolverResult<()> {
+        let _fence = crate::access_token_cache::Invalidation::new();
         let mut nxcache_txn = self.nxcache.lock().await;
         nxcache_txn.clear();
         let mut dbtxn = self.db.write().await;
@@ -846,6 +851,7 @@ where
     }
 
     pub async fn reload_nxset(&self, iter: impl Iterator<Item = (String, u32)>) {
+        let _fence = crate::access_token_cache::Invalidation::new();
         let mut nxset_txn = self.nxset.lock().await;
         nxset_txn.clear();
         for (name, gid) in iter {
@@ -982,6 +988,8 @@ where
     }
 
     async fn set_cache_usertoken(&self, token: &mut UserToken) -> ResolverResult<()> {
+        // Includes identity/validity/UID mapping replacement, not just deletion.
+        let _fence = crate::access_token_cache::Invalidation::new();
         // Set an expiry
         let ex_time = SystemTime::now() + Duration::from_secs(self.timeout_seconds);
         let offset = ex_time
@@ -1053,6 +1061,7 @@ where
     }
 
     async fn delete_cache_usertoken(&self, a_uuid: Uuid) -> ResolverResult<()> {
+        let _fence = crate::access_token_cache::Invalidation::new();
         let mut dbtxn = self.db.write().await;
         dbtxn
             .delete_account(a_uuid)
@@ -1069,6 +1078,7 @@ where
     }
 
     async fn set_cache_userpassword(&self, a_uuid: Uuid, cred: &str) -> ResolverResult<()> {
+        let _fence = crate::access_token_cache::Invalidation::new();
         let mut dbtxn = self.db.write().await;
         let mut hsm_txn = self.hsm.lock().await;
         dbtxn
@@ -1344,6 +1354,7 @@ where
         token: &UnixUserToken,
         new_tok: &str,
     ) -> ResolverResult<bool> {
+        let _fence = crate::access_token_cache::Invalidation::new();
         // Validate the user isn't in the nxset (aka, it's a local user or group).
         if self.check_nxset(Some(account_id), None).await {
             return Ok(false);

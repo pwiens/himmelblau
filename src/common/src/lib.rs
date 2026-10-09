@@ -36,6 +36,8 @@ pub mod unix_config;
 
 // Kanidm modules
 #[cfg(target_family = "unix")]
+pub mod access_token_cache;
+#[cfg(target_family = "unix")]
 pub mod auth;
 #[cfg(target_family = "unix")]
 pub mod client;

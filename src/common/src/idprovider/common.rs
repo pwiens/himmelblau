@@ -163,6 +163,7 @@ impl RefreshCache {
         }
         for k in remove_list.iter() {
             refresh_cache.remove_entry(k);
+            crate::access_token_cache::invalidate_access_tokens();
         }
         let mut refresh_token_cache = self.refresh_token_cache.write().await;
         let mut remove_list = vec![];
@@ -173,10 +174,12 @@ impl RefreshCache {
         }
         for k in remove_list.iter() {
             refresh_token_cache.remove_entry(k);
+            crate::access_token_cache::invalidate_access_tokens();
         }
     }
 
     pub(crate) async fn add(&self, account_id: &str, refresh_token: &RefreshCacheEntry) {
+        let _fence = crate::access_token_cache::Invalidation::new();
         match refresh_token {
             RefreshCacheEntry::Prt(prt) => {
                 let mut refresh_cache = self.refresh_cache.write().await;
@@ -195,12 +198,24 @@ impl RefreshCache {
         }
     }
 
+    /// Renewal of the same authenticated PRT does not replace the sign-in
+    /// context. Do not invalidate the very access-token exchange doing renewal.
+    /// A concurrent sign-in/removal still fences this completion.
+    pub(crate) async fn renew_prt(&self, account_id: &str, prt: SealedData, generation: u64) {
+        let mut cache = self.refresh_cache.write().await;
+        if crate::access_token_cache::access_token_generation() == generation {
+            cache.insert(account_id.to_lowercase(), (prt, SystemTime::now()));
+        }
+    }
+
     pub(crate) async fn remove_prt(&self, account_id: &str) {
+        let _fence = crate::access_token_cache::Invalidation::new();
         let mut refresh_cache = self.refresh_cache.write().await;
         refresh_cache.remove(account_id.to_lowercase().as_str());
     }
 
     pub(crate) async fn remove_refresh_token(&self, account_id: &str) {
+        let _fence = crate::access_token_cache::Invalidation::new();
         self.refresh_token_cache
             .write()
             .await
@@ -254,6 +269,7 @@ impl RefreshCache {
     /// without touching the keystore. The original insertion timestamp
     /// is preserved so that the 24 h purge window is not reset.
     pub async fn import_broker_prts(&self, data: &[u8]) -> Result<(), serde_json::Error> {
+        let _fence = crate::access_token_cache::Invalidation::new();
         let mut refresh_cache = self.refresh_cache.write().await;
         let entries: HashMap<String, (SealedData, u64)> = serde_json::from_slice(data)?;
         for (account_id, (prt, epoch_secs)) in entries {
@@ -1042,6 +1058,10 @@ macro_rules! impl_himmelblau_try_unseal {
 #[macro_export]
 macro_rules! entra_id_prt_token_fetch {
     ($self:ident, $prt:ident, $scopes:ident, $client_id:ident, $redirect_uri:ident, $req_cnf:ident, $tpm:ident, $machine_key:ident) => {{
+        // Counts exchange invocations, not HTTP requests within the library.
+        static EXCHANGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let exchanges = EXCHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        debug!(exchanges, "broker PRT access-token exchange");
         $self
             .client
             .lock()

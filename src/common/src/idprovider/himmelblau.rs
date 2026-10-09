@@ -1174,6 +1174,7 @@ impl IdProvider for HimmelblauProvider {
                     "PRT for {} is {:?} old (>= {:?}), attempting renewal",
                     account_id, age, PRT_REFRESH_AGE
                 );
+                let generation = crate::access_token_cache::access_token_generation();
                 if let Ok(RefreshCacheEntry::Prt(old_prt)) =
                     self.refresh_cache.refresh_token(&account_id).await
                 {
@@ -1186,7 +1187,7 @@ impl IdProvider for HimmelblauProvider {
                     {
                         Ok(new_prt) => {
                             self.refresh_cache
-                                .add(&account_id, &RefreshCacheEntry::Prt(new_prt))
+                                .renew_prt(&account_id, new_prt, generation)
                                 .await;
                             info!("Opportunistic PRT renewal succeeded for {}", account_id);
                         }

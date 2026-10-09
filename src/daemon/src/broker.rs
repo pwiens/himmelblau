@@ -18,8 +18,11 @@
 use async_trait::async_trait;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use himmelblau_unix_common::access_token_cache::{
+    access_token_generation, invalidate_access_tokens, CacheError, IssuedToken,
+};
 use himmelblau_unix_common::idprovider::himmelblau::HimmelblauMultiProvider;
-use himmelblau_unix_common::idprovider::interface::Id;
+use himmelblau_unix_common::idprovider::interface::{Id, UserToken};
 use himmelblau_unix_common::resolver::Resolver;
 use identity_dbus_broker::HimmelblauBroker;
 use libc::uid_t;
@@ -27,7 +30,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::error::Error;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+mod cache;
 use url::Url;
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -105,6 +110,39 @@ pub(crate) struct Broker {
     pub(crate) cachelayer: Arc<Resolver<HimmelblauMultiProvider>>,
 }
 
+impl Broker {
+    /// This authorization runs before EVERY lookup and after every wait. The
+    /// Nix multi-account patch changes only account selection in this method.
+    async fn authorized_user(
+        &self,
+        username: &str,
+        uid: uid_t,
+    ) -> Result<UserToken, Box<dyn Error>> {
+        let user = self
+            .cachelayer
+            .get_usertoken(Id::Gid(uid))
+            .await
+            .map_err(|_| "Unable to load account")?
+            .ok_or("Unable to find account")?;
+        if username.to_lowercase() != user.spn.to_lowercase() {
+            return Err("Invalid request for user!".into());
+        }
+        // The Nix selection may come from the all-account enumerator. Keep
+        // the name-based resolver's exclusion and metadata-expiry checks on
+        // hits too, exactly as get_user_accesstoken does on misses.
+        let user = self
+            .cachelayer
+            .get_usertoken(Id::Name(user.spn.clone()))
+            .await
+            .map_err(|_| "Unable to load account")?
+            .ok_or("Unable to find account")?;
+        if username.to_lowercase() != user.spn.to_lowercase() {
+            return Err("Invalid request for user!".into());
+        }
+        Ok(user)
+    }
+}
+
 #[async_trait]
 impl HimmelblauBroker for Broker {
     async fn acquire_token_interactively(
@@ -114,34 +152,49 @@ impl HimmelblauBroker for Broker {
         request_json: String,
         uid: uid_t,
     ) -> Result<String, Box<dyn Error>> {
-        self.acquire_token_silently(protocol_version, correlation_id, request_json, uid)
+        // Explicit interactive acquisition is an authorization-context refresh,
+        // never permission to return the previous silent result.
+        if request_json.len() > 16 * 1024 {
+            return Err("Token request too large".into());
+        }
+        let mut request: serde_json::Value = serde_json::from_str(&request_json)?;
+        request
+            .get_mut("authParameters")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or("Invalid authParameters")?
+            .insert("forceRefresh".into(), json!(true));
+        self.acquire_token_silently(protocol_version, correlation_id, request.to_string(), uid)
             .await
     }
 
     async fn acquire_token_silently(
         &mut self,
-        _protocol_version: String,
+        protocol_version: String,
         _correlation_id: String,
         request_json: String,
         uid: uid_t,
     ) -> Result<String, Box<dyn Error>> {
-        // Double check the user is making a request for their own account
-        let user = self
-            .cachelayer
-            .get_usertoken(Id::Gid(uid))
-            .await
-            .map_err(|_| "Unable to load account")?
-            .ok_or("Unable to find account")?;
-        let request: TokenReq =
-            serde_json::from_str(&request_json).map_err(|e| format!("{:?}", e))?;
+        // Bound authorization/DB/HSM waits too, including when another caller
+        // has a stuck interactive flow. Dropping this future cancels its flight.
+        tokio::time::timeout(Duration::from_secs(45), async {
+        if request_json.len() > 16 * 1024 { return Err("Token request too large".into()); }
+        let raw: serde_json::Value = serde_json::from_str(&request_json)?;
+        let request: TokenReq = serde_json::from_value(raw.clone())?;
         // account can be at root (Firefox, Chrome) or in authParameters (Edge)
         let account = match request.account {
             Some(x) => x,
             None => request.auth_parameters.account.ok_or("Missing account")?,
         };
-        if account.username.to_lowercase() != user.spn.to_lowercase() {
-            return Err("Invalid request for user!".into());
+        let user = self.authorized_user(&account.username, uid).await?;
+        let policy = cache::request_policy(&raw, &user)?;
+        if policy.force_refresh { invalidate_access_tokens(); }
+        if policy.claims_challenge {
+            invalidate_access_tokens();
+            // The pinned provider does not accept claims. Do not silently
+            // satisfy a challenge with an ordinary bearer token.
+            return Err("Claims challenges are not supported by this provider".into());
         }
+        let generation = access_token_generation();
         // Normalize and validate the redirect URI: treat empty/whitespace as
         // None, and reject values that are not valid URIs or that contain fragments.
         let redirect_uri = match request.auth_parameters.redirect_uri {
@@ -160,34 +213,45 @@ impl HimmelblauBroker for Broker {
             None => None,
         };
         let req_cnf = build_req_cnf(&request.auth_parameters.pop_params);
-        let token = self
-            .cachelayer
-            .get_user_accesstoken(
-                Id::Name(user.spn.clone()),
-                request.auth_parameters.requested_scopes,
-                request.auth_parameters.client_id,
-                redirect_uri,
-                req_cnf,
-            )
-            .await
-            .ok_or("Failed to authenticate user")?;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| format!("{:?}", e))?;
-        let res = json!({
-            "brokerTokenResponse": {
-                "accessToken": token.access_token.clone()
-                    .ok_or("Failed to fetch access token")?,
-                "accessTokenType": 0,
-                "clientInfo": URL_SAFE_NO_PAD.encode(json!(&token.client_info).to_string()),
-                "expiresOn": now.as_millis() + u128::from(token.expires_in) * 1000,
-                "extendedExpiresOn": (token.ext_expires_in as u64) + now.as_secs(),
-                "grantedScopes": token.scope.clone()
-                    .ok_or("Failed to fetch scopes")?,
-                "idToken": token.id_token.raw.clone().ok_or("Missing raw token")?,
-            }
-        });
-        Ok(res.to_string())
+        let acquire = || async {
+            let started = SystemTime::now();
+            let token = self.cachelayer.get_user_accesstoken(
+                Id::Name(user.spn.clone()), request.auth_parameters.requested_scopes,
+                request.auth_parameters.client_id.clone(), redirect_uri, req_cnf,
+            ).await.ok_or(CacheError::Acquisition)?;
+            let expires_at = cache::validated_expiry(&token, &user,
+                request.auth_parameters.client_id.as_deref(), started);
+            let now = started.duration_since(UNIX_EPOCH).map_err(|_| CacheError::Acquisition)?;
+            let res = json!({
+                "brokerTokenResponse": {
+                    "accessToken": token.access_token.as_ref().ok_or(CacheError::Acquisition)?,
+                    "accessTokenType": 0,
+                    "clientInfo": URL_SAFE_NO_PAD.encode(json!(&token.client_info).to_string()),
+                    "expiresOn": now.as_millis() + u128::from(token.expires_in) * 1000,
+                    "extendedExpiresOn": u64::from(token.ext_expires_in) + now.as_secs(),
+                    "grantedScopes": token.scope.as_ref().ok_or(CacheError::Acquisition)?,
+                    "idToken": token.id_token.raw.as_ref().ok_or(CacheError::Acquisition)?,
+                }
+            });
+            Ok(IssuedToken { response: res.to_string().into(), expires_at })
+        };
+        let response = if policy.cacheable {
+            let key = cache::key(uid, &user, &raw, &protocol_version);
+            self.cachelayer.broker_access_tokens.get_or_acquire(key, acquire).await?
+        } else {
+            // Unsupported/unknown issuance context never collides with bearer
+            // cache entries. Preserve the existing provider path, bounded.
+            Arc::new(tokio::time::timeout(Duration::from_secs(40), acquire()).await
+                .map_err(|_| CacheError::Timeout)??.response)
+        };
+        let current = self.authorized_user(&account.username, uid).await?;
+        if current.uuid != user.uuid || current.tenant_id != user.tenant_id
+            || current.spn != user.spn || generation != access_token_generation() {
+            return Err(CacheError::Invalidated.into());
+        }
+        tracing::debug!(stats = ?self.cachelayer.broker_access_tokens.stats(), "broker access-token cache");
+        Ok::<String, Box<dyn Error>>(response.as_str().to_owned())
+        }).await.map_err(|_| CacheError::Timeout)?
     }
 
     async fn get_accounts(
@@ -225,9 +289,14 @@ impl HimmelblauBroker for Broker {
         &mut self,
         _protocol_version: String,
         _correlation_id: String,
-        _request_json: String,
-        _uid: uid_t,
+        request_json: String,
+        uid: uid_t,
     ) -> Result<String, Box<dyn Error>> {
+        let request: SsoCookieReq = serde_json::from_str(&request_json)?;
+        self.authorized_user(&request.account.username, uid).await?;
+        invalidate_access_tokens();
+        // Account/PRT removal is still unsupported. Do not claim logout or
+        // silently delete credentials, but never retain an access-token hit.
         Err("Not implemented".into())
     }
 
