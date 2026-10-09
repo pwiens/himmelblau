@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::watch;
 use zeroize::Zeroizing;
 
@@ -66,10 +66,11 @@ impl std::fmt::Display for CacheError {
 }
 impl std::error::Error for CacheError {}
 
-/// Expiry is absolute and computed at issuance, never extended on a hit.
+/// Both bounds are computed before issuance, never extended on a hit. The
+/// monotonic expires_in bound prevents a wall-clock rollback extending reuse.
 pub struct IssuedToken {
     pub response: Zeroizing<String>,
-    pub expires_at: Option<SystemTime>,
+    pub expires_at: Option<(SystemTime, Instant)>,
 }
 struct Entry {
     generation: u64,
@@ -78,8 +79,8 @@ struct Entry {
 }
 enum State {
     Pending(watch::Sender<Option<ResultToken>>),
-    Ready(SecretResponse, SystemTime),
-    Failed(CacheError, SystemTime),
+    Ready(SecretResponse, (SystemTime, Instant)),
+    Failed(CacheError, Instant),
 }
 #[derive(Default)]
 struct Inner {
@@ -105,17 +106,23 @@ pub struct CacheStats {
 pub struct AccessTokenCache {
     inner: Mutex<Inner>,
     generation: Arc<AtomicU64>,
-    clock: Arc<dyn Fn() -> SystemTime + Send + Sync>,
+    clock: Arc<dyn Fn() -> (SystemTime, Instant) + Send + Sync>,
     counters: Counters,
     timeout: Duration,
 }
 impl Default for AccessTokenCache {
     fn default() -> Self {
-        Self::new(GENERATION.clone(), Arc::new(SystemTime::now))
+        Self::new(
+            GENERATION.clone(),
+            Arc::new(|| (SystemTime::now(), Instant::now())),
+        )
     }
 }
 impl AccessTokenCache {
-    fn new(generation: Arc<AtomicU64>, clock: Arc<dyn Fn() -> SystemTime + Send + Sync>) -> Self {
+    fn new(
+        generation: Arc<AtomicU64>,
+        clock: Arc<dyn Fn() -> (SystemTime, Instant) + Send + Sync>,
+    ) -> Self {
         Self {
             inner: Mutex::new(Inner::default()),
             generation,
@@ -154,7 +161,7 @@ impl AccessTokenCache {
                 // forced refresh cannot start a replacement request storm.
                 State::Pending(_) => true,
                 State::Ready(_, expiry) => entry.generation == generation && usable(*expiry, now),
-                State::Failed(_, until) => entry.generation == generation && *until > now,
+                State::Failed(_, until) => entry.generation == generation && *until > now.1,
             });
             inner.sequence = inner.sequence.wrapping_add(1);
             let touched = inner.sequence;
@@ -247,10 +254,15 @@ impl AccessTokenCache {
         }
     }
 }
-fn usable(expiry: SystemTime, now: SystemTime) -> bool {
+fn usable(expiry: (SystemTime, Instant), now: (SystemTime, Instant)) -> bool {
     expiry
-        .duration_since(now)
+        .0
+        .duration_since(now.0)
         .is_ok_and(|remaining| remaining > EXPIRY_MARGIN)
+        && expiry
+            .1
+            .checked_duration_since(now.1)
+            .is_some_and(|remaining| remaining > EXPIRY_MARGIN)
 }
 struct Flight<'a> {
     cache: &'a AccessTokenCache,
@@ -259,7 +271,7 @@ struct Flight<'a> {
     complete: bool,
 }
 impl Flight<'_> {
-    fn finish(&mut self, result: ResultToken, expiry: Option<SystemTime>) {
+    fn finish(&mut self, result: ResultToken, expiry: Option<(SystemTime, Instant)>) {
         if result.is_err() {
             self.cache.counters.failures.fetch_add(1, Ordering::Relaxed);
         }
@@ -273,7 +285,7 @@ impl Flight<'_> {
                     entry.state = match (result, expiry) {
                         (Ok(token), Some(expiry)) => State::Ready(token, expiry),
                         (Err(error), _) => {
-                            State::Failed(error, (self.cache.clock)() + FAILURE_BACKOFF)
+                            State::Failed(error, (self.cache.clock)().1 + FAILURE_BACKOFF)
                         }
                         // Unknown/near expiry and oversized responses may be
                         // returned to this flight, but never reused later.

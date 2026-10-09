@@ -3,6 +3,14 @@ use super::*;
 use std::sync::atomic::AtomicBool;
 use tokio::sync::Notify;
 
+static ORIGIN: LazyLock<Instant> = LazyLock::new(Instant::now);
+fn moment(seconds: u64) -> (SystemTime, Instant) {
+    (
+        SystemTime::UNIX_EPOCH + Duration::from_secs(seconds),
+        *ORIGIN + Duration::from_secs(seconds),
+    )
+}
+
 fn fixture() -> (Arc<AccessTokenCache>, Arc<AtomicU64>, Arc<AtomicU64>) {
     let clock = Arc::new(AtomicU64::new(1000));
     let generation = Arc::new(AtomicU64::new(0));
@@ -10,9 +18,7 @@ fn fixture() -> (Arc<AccessTokenCache>, Arc<AtomicU64>, Arc<AtomicU64>) {
     (
         Arc::new(AccessTokenCache::new(
             generation.clone(),
-            Arc::new(move || {
-                SystemTime::UNIX_EPOCH + Duration::from_secs(now.load(Ordering::SeqCst))
-            }),
+            Arc::new(move || moment(now.load(Ordering::SeqCst))),
         )),
         clock,
         generation,
@@ -21,7 +27,7 @@ fn fixture() -> (Arc<AccessTokenCache>, Arc<AtomicU64>, Arc<AtomicU64>) {
 fn issued(expiry: Option<u64>) -> Result<IssuedToken, CacheError> {
     Ok(IssuedToken {
         response: "synthetic-fixture".to_string().into(),
-        expires_at: expiry.map(|s| SystemTime::UNIX_EPOCH + Duration::from_secs(s)),
+        expires_at: expiry.map(moment),
     })
 }
 #[tokio::test]
@@ -49,6 +55,47 @@ async fn reuse_expiry_and_unknown_expiry() {
         .is_ok());
     assert_eq!(cache.stats().acquisitions, 4);
 }
+#[tokio::test]
+async fn wall_clock_jumps_cannot_extend_tokens_or_change_backoff() {
+    let (mut cache, wall, _) = fixture();
+    let mono = Arc::new(AtomicU64::new(1000));
+    let (w, m) = (wall.clone(), mono.clone());
+    Arc::get_mut(&mut cache).unwrap().clock = Arc::new(move || {
+        (
+            moment(w.load(Ordering::SeqCst)).0,
+            moment(m.load(Ordering::SeqCst)).1,
+        )
+    });
+    assert!(cache
+        .get_or_acquire("token".into(), || async { issued(Some(2000)) })
+        .await
+        .is_ok());
+    wall.store(500, Ordering::SeqCst);
+    mono.store(1940, Ordering::SeqCst);
+    assert!(cache
+        .get_or_acquire("token".into(), || async { issued(Some(3000)) })
+        .await
+        .is_ok());
+    assert_eq!(cache.stats().acquisitions, 2);
+    assert!(cache
+        .get_or_acquire("failure".into(), || async { Err(CacheError::Acquisition) })
+        .await
+        .is_err());
+    wall.store(100_000, Ordering::SeqCst);
+    assert!(cache
+        .get_or_acquire("failure".into(), || async {
+            panic!("wall jump bypassed backoff")
+        })
+        .await
+        .is_err());
+    mono.store(1943, Ordering::SeqCst);
+    assert!(cache
+        .get_or_acquire("failure".into(), || async { issued(None) })
+        .await
+        .is_ok());
+    assert_eq!(cache.stats().acquisitions, 4);
+}
+
 #[tokio::test]
 async fn concurrent_singleflight_and_different_keys_progress() {
     let (cache, _, _) = fixture();
@@ -240,7 +287,7 @@ async fn capacity_and_oversized_values_are_bounded() {
             .get_or_acquire("large".into(), || async {
                 Ok(IssuedToken {
                     response: "x".repeat(MAX_RESPONSE + 1).into(),
-                    expires_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(2000)),
+                    expires_at: Some(moment(2000)),
                 })
             })
             .await

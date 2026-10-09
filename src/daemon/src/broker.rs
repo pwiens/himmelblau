@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::error::Error;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod cache;
 use url::Url;
@@ -215,12 +215,14 @@ impl HimmelblauBroker for Broker {
         let req_cnf = build_req_cnf(&request.auth_parameters.pop_params);
         let acquire = || async {
             let started = SystemTime::now();
+            let started_monotonic = Instant::now();
             let token = self.cachelayer.get_user_accesstoken(
                 Id::Name(user.spn.clone()), request.auth_parameters.requested_scopes,
                 request.auth_parameters.client_id.clone(), redirect_uri, req_cnf,
             ).await.ok_or(CacheError::Acquisition)?;
             let expires_at = cache::validated_expiry(&token, &user,
-                request.auth_parameters.client_id.as_deref(), started);
+                request.auth_parameters.client_id.as_deref(), started)
+                .and_then(|expiry| Some((expiry, started_monotonic.checked_add(expiry.duration_since(started).ok()?)?)));
             let now = started.duration_since(UNIX_EPOCH).map_err(|_| CacheError::Acquisition)?;
             let res = json!({
                 "brokerTokenResponse": {
