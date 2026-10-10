@@ -116,6 +116,34 @@ where
     }
 }
 
+fn cache_refresh_token_with_loaded_hello_key<K: KeyStoreTxn>(
+    keystore: &mut K,
+    tpm: &mut tpm::provider::BoxedDynTpm,
+    hello_storage_key: &tpm::structures::StorageKey,
+    refresh_token: &str,
+    account_id: &str,
+    refresh_token_tag: &str,
+) -> Result<(), IdpError> {
+    let sealed_refresh_token = tpm
+        .seal_data(
+            hello_storage_key,
+            Zeroizing::new(refresh_token.as_bytes().to_vec()),
+        )
+        .map_err(|e| {
+            error!(?e, account_id, "Failed to seal refresh token");
+            IdpError::Tpm
+        })?;
+    keystore
+        .insert_tagged_hsm_key(refresh_token_tag, &sealed_refresh_token)
+        .map_err(|e| {
+            error!(
+                ?e,
+                account_id, refresh_token_tag, "Failed to cache hello refresh token"
+            );
+            IdpError::Tpm
+        })
+}
+
 fn unseal_refresh_token_with_loaded_hello_key(
     tpm: &mut tpm::provider::BoxedDynTpm,
     hello_storage_key: &tpm::structures::StorageKey,
@@ -954,6 +982,33 @@ impl IdProvider for HimmelblauMultiProvider {
 
 // If the provider is offline, we need to backoff and wait a bit.
 const OFFLINE_NEXT_CHECK: Duration = Duration::from_secs(15);
+
+async fn probe_entra_authority(
+    authority_url: &str,
+    request_timeout: u64,
+    now: SystemTime,
+) -> CacheState {
+    // The authority root may redirect to an unrelated, proxy-blocked host.
+    // A response from the authority itself is sufficient for reachability.
+    let client = match build_online_probe_client(request_timeout, reqwest::redirect::Policy::none())
+    {
+        Ok(c) => c,
+        Err(e) => {
+            error!(?e, "Failed to build HTTP client for online check");
+            return CacheState::OfflineNextCheck(now + OFFLINE_NEXT_CHECK);
+        }
+    };
+    match client.get(authority_url).send().await {
+        Ok(_) => {
+            debug!("provider is now online");
+            CacheState::Online
+        }
+        Err(err) => {
+            error!(?err, "Provider online failed");
+            CacheState::OfflineNextCheck(now + OFFLINE_NEXT_CHECK)
+        }
+    }
+}
 
 pub struct HimmelblauProvider {
     state: Mutex<CacheState>,
@@ -3561,32 +3616,16 @@ impl IdProvider for HimmelblauProvider {
                     }
                 } else {
                     // If there is no PRT, cache the refresh token instead
-                    let pin = PinValue::new(&$cred).map_err(|e| {
-                        error!("Failed initializing pin value: {:?}", e);
-                        IdpError::Tpm
-                    })?;
-                    let (_key, win_hello_storage_key) = tpm
-                        .ms_hello_key_load(machine_key, &$hello_key, &pin)
-                        .map_err(|e| {
-                            error!("Failed loading hello key for prt cache: {:?}", e);
-                            IdpError::Tpm
-                        })?;
-                    let refresh_token_zeroizing =
-                        zeroize::Zeroizing::new(token.refresh_token.as_bytes().to_vec());
-                    tpm.seal_data(&win_hello_storage_key, refresh_token_zeroizing)
-                        .map_err(|e| {
-                            let uuid = token.uuid().map(|v| v.to_string()).unwrap_or("".to_string());
-                            error!("Failed to seal refresh token for {}: {:?}", uuid, e);
-                            IdpError::Tpm
-                        })
-                        .and_then(|sealed_prt| {
-                            let hello_prt_tag = self.fetch_hello_refresh_token_key_tag(account_id);
-                            keystore.insert_tagged_hsm_key(&hello_prt_tag, &sealed_prt).map_err(|e| {
-                                let uuid = token.uuid().map(|v| v.to_string()).unwrap_or("".to_string());
-                                error!("Failed to cache hello refresh token for {}: {:?}", uuid, e);
-                                IdpError::Tpm
-                            })
-                        })?;
+                    let hello_refresh_token_tag =
+                        self.fetch_hello_refresh_token_key_tag(account_id);
+                    cache_refresh_token_with_loaded_hello_key(
+                        keystore,
+                        tpm,
+                        &win_hello_storage_key,
+                        &token.refresh_token,
+                        account_id,
+                        &hello_refresh_token_tag,
+                    )?;
                 }
 
                 if !self.is_intune_enrolled(keystore).await {
@@ -4831,40 +4870,12 @@ impl HimmelblauProvider {
             .await
             .unwrap_or(self.config.lock().await.get_authority_host(&self.domain));
         let request_timeout = self.config.lock().await.get_request_timeout();
-        let client = match build_online_probe_client(request_timeout) {
-            Ok(c) => c,
-            Err(e) => {
-                error!(?e, "Failed to build HTTP client for online check");
-                let mut state = self.state.lock().await;
-                *state = CacheState::OfflineNextCheck(now + OFFLINE_NEXT_CHECK);
-                return false;
-            }
-        };
-        match client
-            .get(format!("https://{}", authority_host))
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                if resp.status().is_success() {
-                    debug!("provider is now online");
-                    let mut state = self.state.lock().await;
-                    *state = CacheState::Online;
-                    return true;
-                } else {
-                    error!("Provider online failed: {}", resp.status());
-                    let mut state = self.state.lock().await;
-                    *state = CacheState::OfflineNextCheck(now + OFFLINE_NEXT_CHECK);
-                    return false;
-                }
-            }
-            Err(err) => {
-                error!(?err, "Provider online failed");
-                let mut state = self.state.lock().await;
-                *state = CacheState::OfflineNextCheck(now + OFFLINE_NEXT_CHECK);
-                return false;
-            }
-        }
+        let next_state =
+            probe_entra_authority(&format!("https://{}", authority_host), request_timeout, now)
+                .await;
+        let online = matches!(next_state, CacheState::Online);
+        *self.state.lock().await = next_state;
+        online
     }
 
     impl_himmelblau_hello_key_helpers!();
@@ -5952,21 +5963,106 @@ impl HimmelblauProvider {
 #[cfg(test)]
 mod tests {
     use super::{
-        cached_prt_or_refresh_token, is_device_removed_error, is_mfa_required_for_enrollment,
-        is_sspr_required, is_unavailable_mfa_method_error, mfa_flow_uses_push_hint,
-        password_change_required, unexpired_prt_entry, unseal_refresh_token_with_loaded_hello_key,
-        CONSENT_REQUIRED, PASSWORD_RESET_REGISTRATION_REQUIRED,
+        cache_refresh_token_with_loaded_hello_key, cached_prt_or_refresh_token,
+        is_device_removed_error, is_mfa_required_for_enrollment, is_sspr_required,
+        is_unavailable_mfa_method_error, mfa_flow_uses_push_hint, password_change_required,
+        unexpired_prt_entry, unseal_refresh_token_with_loaded_hello_key, CONSENT_REQUIRED,
+        PASSWORD_RESET_REGISTRATION_REQUIRED,
     };
+    use crate::db::{CacheError, KeyStoreTxn};
     use crate::idprovider::common::RefreshCacheEntry;
     use crate::idprovider::interface::{AuthCacheAction, AuthCredHandler, AuthRequest, AuthResult};
     use himmelblau::error::{AADSTSError, ErrorResponse, MsalError, DEVICE_AUTH_FAIL};
     use himmelblau::{MFAAuthContinue, MfaMethodInfo};
     use kanidm_hsm_crypto::{
         provider::{BoxedDynTpm, SoftTpm, Tpm},
+        structures::SealedData,
         AuthValue, PinValue,
     };
-    use std::cell::Cell;
+    use std::{cell::Cell, collections::HashMap};
     use zeroize::Zeroizing;
+
+    #[tokio::test]
+    async fn entra_authority_response_marks_online_without_following_redirects() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        for status in ["302 Found", "404 Not Found", "503 Service Unavailable"] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                socket.read(&mut request).await.unwrap();
+                // Following the redirect would fail like the blocked host in #1733.
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nLocation: http://127.0.0.1:0/blocked\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            });
+            let state = super::probe_entra_authority(
+                &format!("http://{address}/"),
+                5,
+                std::time::SystemTime::now(),
+            )
+            .await;
+            assert!(matches!(state, super::CacheState::Online), "{status}");
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn entra_authority_connection_failure_keeps_offline_retry() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let now = std::time::SystemTime::now();
+        let state = super::probe_entra_authority(&format!("http://{address}/"), 5, now).await;
+        match state {
+            super::CacheState::OfflineNextCheck(deadline) => {
+                assert_eq!(deadline, now + super::OFFLINE_NEXT_CHECK);
+            }
+            _ => panic!("connection failure should schedule an offline retry"),
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingKeyStore {
+        entries: HashMap<String, Vec<u8>>,
+        inserted_tags: Vec<String>,
+        fail_insert: bool,
+    }
+
+    impl KeyStoreTxn for RecordingKeyStore {
+        fn get_tagged_hsm_key<K: serde::de::DeserializeOwned>(
+            &mut self,
+            tag: &str,
+        ) -> Result<Option<K>, CacheError> {
+            self.entries
+                .get(tag)
+                .map(|entry| serde_cbor::from_slice(entry).map_err(|_| CacheError::SerdeJson))
+                .transpose()
+        }
+
+        fn insert_tagged_hsm_key<K: serde::Serialize>(
+            &mut self,
+            tag: &str,
+            key: &K,
+        ) -> Result<(), CacheError> {
+            if self.fail_insert {
+                return Err(CacheError::Sqlite);
+            }
+            let entry = serde_cbor::to_vec(key).map_err(|_| CacheError::SerdeJson)?;
+            self.entries.insert(tag.to_string(), entry);
+            self.inserted_tags.push(tag.to_string());
+            Ok(())
+        }
+
+        fn delete_tagged_hsm_key(&mut self, tag: &str) -> Result<(), CacheError> {
+            self.entries.remove(tag);
+            Ok(())
+        }
+    }
 
     fn should_use_sspr_hello_fallback(e: &MsalError, is_remote_service: bool) -> bool {
         is_sspr_required(e) && !is_remote_service
@@ -6092,7 +6188,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_token_unseal_reuses_loaded_hello_key() -> anyhow::Result<()> {
+    fn refresh_token_storage_reuses_loaded_hello_key() -> anyhow::Result<()> {
         let mut tpm = BoxedDynTpm::new(SoftTpm::new());
         let auth = AuthValue::ephemeral().map_err(|e| anyhow::anyhow!("{e:?}"))?;
         let loadable_machine_key = tpm
@@ -6109,12 +6205,23 @@ mod tests {
             .ms_hello_key_load(&machine_key, &hello_key, &pin)
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
-        let sealed_refresh_token = tpm
-            .seal_data(
-                &hello_storage_key,
-                Zeroizing::new(b"refresh-token".to_vec()),
-            )
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let account_id = "testuser@example.com";
+        let refresh_token_tag = format!("{account_id}/hello_refresh_token");
+        let mut keystore = RecordingKeyStore::default();
+        cache_refresh_token_with_loaded_hello_key(
+            &mut keystore,
+            &mut tpm,
+            &hello_storage_key,
+            "refresh-token",
+            account_id,
+            &refresh_token_tag,
+        )
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        assert_eq!(keystore.inserted_tags, vec![refresh_token_tag.clone()]);
+        let sealed_refresh_token: SealedData = keystore
+            .get_tagged_hsm_key(&refresh_token_tag)
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?
+            .ok_or_else(|| anyhow::anyhow!("refresh token was not persisted"))?;
         assert_eq!(
             unseal_refresh_token_with_loaded_hello_key(
                 &mut tpm,
@@ -6124,6 +6231,20 @@ mod tests {
             .map_err(|e| anyhow::anyhow!("{e:?}"))?,
             Some("refresh-token".to_string())
         );
+
+        let mut failing_keystore = RecordingKeyStore {
+            fail_insert: true,
+            ..Default::default()
+        };
+        assert!(cache_refresh_token_with_loaded_hello_key(
+            &mut failing_keystore,
+            &mut tpm,
+            &hello_storage_key,
+            "refresh-token",
+            account_id,
+            &refresh_token_tag,
+        )
+        .is_err());
 
         let invalid_utf8 = tpm
             .seal_data(&hello_storage_key, Zeroizing::new(vec![0xff]))

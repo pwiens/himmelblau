@@ -26,6 +26,17 @@ class Arm64RpmDockerfileTests(unittest.TestCase):
 
 
 class PackagingToolTests(unittest.TestCase):
+    def test_rpm_images_install_native_dependency_scanner(self):
+        for name, config in gen_dockerfiles.DISTS.items():
+            if config["family"] not in ("rpm", "zypper"):
+                continue
+            for arch in gen_dockerfiles.ARCH_MAP:
+                with self.subTest(distro=name, arch=arch):
+                    dockerfile = gen_dockerfiles.render(
+                        name, config, patch_libhimmelblau=False, arch=arch
+                    )
+                    self.assertIn("rpm-build", dockerfile.split())
+
     def test_packaging_tools_match_distro_family_on_each_architecture(self):
         for name, config in gen_dockerfiles.DISTS.items():
             for arch in gen_dockerfiles.ARCH_MAP:
@@ -42,6 +53,47 @@ class PackagingToolTests(unittest.TestCase):
                         self.assertNotIn("cargo-deb", dockerfile)
                     else:
                         self.assertNotIn("cargo install", dockerfile)
+
+    def test_rpm_release_defaults_to_one_and_can_be_overridden(self):
+        dockerfile = gen_dockerfiles.render(
+            "rocky9",
+            gen_dockerfiles.DISTS["rocky9"],
+            patch_libhimmelblau=False,
+            arch="amd64",
+        )
+
+        self.assertIn(r'''RPM_INTERNAL_RELEASE=\"${RPM_PACKAGE_RELEASE:-1}\"''', dockerfile)
+        self.assertIn(
+            r'''--set-metadata \"release = '${RPM_INTERNAL_RELEASE}'\"''',
+            dockerfile,
+        )
+
+    def test_interdependent_rpms_require_matching_versions(self):
+        dockerfile = gen_dockerfiles.render(
+            "rocky9",
+            gen_dockerfiles.DISTS["rocky9"],
+            patch_libhimmelblau=False,
+            arch="amd64",
+        )
+
+        expected = {
+            "src/nss": "himmelblau",
+            "src/pam": "himmelblau",
+            "src/broker": "himmelblau",
+            "src/sso": "himmelblau-broker",
+            "src/o365": "himmelblau",
+        }
+        self.assertIn("RPM_INTERNAL_VERSION=$(cargo metadata --no-deps", dockerfile)
+        for crate, dependency in expected.items():
+            with self.subTest(crate=crate):
+                self.assertIn(
+                    f"cargo generate-rpm -p {crate} "
+                    + r'''--set-metadata \"release = '${RPM_INTERNAL_RELEASE}'\" '''
+                    + r'''--set-metadata \"requires = { '''
+                    + f"{dependency} = '= ${{RPM_INTERNAL_VERSION}}-${{RPM_INTERNAL_RELEASE}}'"
+                    + r''' }\"''',
+                    dockerfile,
+                )
 
 
 class SleRepositoryTests(unittest.TestCase):

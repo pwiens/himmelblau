@@ -25,7 +25,7 @@ use std::fs::metadata;
 use std::io;
 use std::io::Error as IoError;
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::io::FromRawFd;
+use std::os::unix::io::{FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -55,7 +55,7 @@ use idmap::{gen_subid_start, SUBID_COUNT};
 use uuid::Uuid;
 
 use kanidm_utils_users::{get_current_gid, get_current_uid, get_effective_gid, get_effective_uid};
-use libc::umask;
+use libc::{close, umask};
 use sd_notify::NotifyState;
 use sketching::tracing_forest::traits::*;
 use sketching::tracing_forest::util::*;
@@ -71,7 +71,7 @@ use tokio::time;
 use tokio_util::codec::{Decoder, Encoder, Framed};
 use tracing::span;
 
-use kanidm_hsm_crypto::{provider::BoxedDynTpm, provider::SoftTpm, provider::Tpm};
+use kanidm_hsm_crypto::provider::Tpm;
 
 use notify_debouncer_full::{new_debouncer, notify::RecursiveMode};
 
@@ -174,6 +174,47 @@ impl Encoder<TaskRequest> for TaskCodec {
         })?;
         dst.put(data.as_slice());
         Ok(())
+    }
+}
+
+/// ListenStream paths in platform/systemd. The config defaults use /var/run,
+/// which is the same directory as /run.
+const ACTIVATED_MAIN_SOCKET: &str = "/run/himmelblaud/socket";
+const ACTIVATED_TASK_SOCKET: &str = "/run/himmelblaud/task_sock";
+const ACTIVATED_BROKER_SOCKET: &str = "/run/himmelblaud/broker_sock";
+
+fn normalize_socket_path(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if let Some(rest) = trimmed.strip_prefix("/var/run/") {
+        format!("/run/{rest}")
+    } else if trimmed == "/var/run" {
+        "/run".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn socket_paths_equivalent(configured: &str, activated: &str) -> bool {
+    normalize_socket_path(configured) == normalize_socket_path(activated)
+}
+
+/// Drop a socket-activated fd when himmelblau.conf names a different path.
+/// PAM, NSS, and the CLI connect to the configured path, not the unit path.
+fn release_activated_socket_unless_configured(
+    activated: &mut Option<RawFd>,
+    configured: &str,
+    unit_path: &str,
+) {
+    if socket_paths_equivalent(configured, unit_path) {
+        return;
+    }
+    if let Some(fd) = activated.take() {
+        debug!(
+            configured,
+            unit_path, "socket path is not the systemd unit path; binding the configured path"
+        );
+        // SAFETY: this fd was passed in by systemd and is owned by this process.
+        let _ = unsafe { close(fd) };
     }
 }
 
@@ -760,64 +801,11 @@ async fn handle_client(
                                                     if cfg.get_fetch_profile_picture()
                                                         && !is_oidc_auth
                                                     {
-                                                        if let Some(token) = cachelayer
-                                                            .get_user_accesstoken(
-                                                                Id::Name(account_id.to_string()),
-                                                                vec![],
-                                                                None,
-                                                                None,
-                                                                None,
-                                                            )
-                                                            .await
-                                                        {
-                                                            if let Some(access_token) = &token.access_token {
-                                                                let (tx, rx) = oneshot::channel();
-
-                                                                match task_channel_tx
-                                                                    .send_timeout(
-                                                                        (
-                                                                            TaskRequest::LoadProfilePhoto(
-                                                                                account_id.to_string(),
-                                                                                access_token.to_string(),
-                                                                            ),
-                                                                            tx,
-                                                                        ),
-                                                                        Duration::from_millis(100),
-                                                                    )
-                                                                    .await
-                                                                {
-                                                                    Ok(()) => {
-                                                                        // Now wait for the other end OR timeout.
-                                                                        match time::timeout_at(
-                                                                            time::Instant::now()
-                                                                                + Duration::from_secs(60),
-                                                                            rx,
-                                                                        )
-                                                                        .await
-                                                                        {
-                                                                            Ok(Ok(outcome)) if profile_photo_task_succeeded(&outcome) => {
-                                                                                info!("Fetching user profile picture succeeded");
-                                                                            }
-                                                                            Ok(Ok(TaskOutcome::Status(status))) => {
-                                                                                error!("Fetching user profile picture failed: status code {}", status);
-                                                                            }
-                                                                            Ok(Ok(TaskOutcome::NonCompliant(_))) => {
-                                                                                error!("Fetching user profile picture: unexpected NonCompliant task outcome");
-                                                                            }
-                                                                            Ok(Err(e)) => {
-                                                                                error!("Fetching user profile picture failed: {:?}", e);
-                                                                            }
-                                                                            Err(e) => {
-                                                                                error!("Fetching user profile picture failed: {:?}", e);
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                    Err(_) => {
-                                                                        error!("Fetching user profile picture failed");
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
+                                                        spawn_profile_photo_fetch(
+                                                            cachelayer.clone(),
+                                                            task_channel_tx.clone(),
+                                                            account_id.clone(),
+                                                        );
                                                     }
 
                                                     // Apply Intune policies
@@ -1313,6 +1301,59 @@ async fn spawn_intune_policy_application_if_due(
     );
 }
 
+fn spawn_profile_photo_fetch(
+    cachelayer: Arc<Resolver<HimmelblauMultiProvider>>,
+    task_channel_tx: Sender<AsyncTaskRequest>,
+    account_id: String,
+) {
+    tokio::spawn(async move {
+        let Some(token) = cachelayer
+            .get_user_accesstoken(Id::Name(account_id.clone()), vec![], None, None, None)
+            .await
+        else {
+            return;
+        };
+        let Some(access_token) = token.access_token.as_ref() else {
+            return;
+        };
+        let (tx, rx) = oneshot::channel();
+        if task_channel_tx
+            .send_timeout(
+                (
+                    TaskRequest::LoadProfilePhoto(account_id, access_token.to_string()),
+                    tx,
+                ),
+                Duration::from_millis(100),
+            )
+            .await
+            .is_err()
+        {
+            error!("Fetching user profile picture failed");
+            return;
+        }
+        match time::timeout_at(time::Instant::now() + Duration::from_secs(60), rx).await {
+            Ok(Ok(outcome)) if profile_photo_task_succeeded(&outcome) => {
+                debug!("Profile photo fetch accepted by the tasks daemon");
+            }
+            Ok(Ok(TaskOutcome::Status(status))) => {
+                error!(
+                    "Fetching user profile picture failed: status code {}",
+                    status
+                );
+            }
+            Ok(Ok(TaskOutcome::NonCompliant(_))) => {
+                error!("Fetching user profile picture: unexpected NonCompliant task outcome");
+            }
+            Ok(Err(e)) => {
+                error!("Fetching user profile picture failed: {:?}", e);
+            }
+            Err(e) => {
+                error!("Fetching user profile picture failed: {:?}", e);
+            }
+        }
+    });
+}
+
 fn spawn_intune_policy_application(
     cachelayer: Arc<Resolver<HimmelblauMultiProvider>>,
     cfg: HimmelblauConfig,
@@ -1453,11 +1494,34 @@ async fn apply_intune_policy_for_account(
     }
 }
 
+// Keep this long-standing test module in place to avoid unrelated churn in
+// stable backports when production helpers are added below it.
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const ACCOUNT_ID: &str = "user@example.com";
+
+    #[test]
+    fn default_socket_paths_match_the_systemd_units() {
+        assert!(socket_paths_equivalent(
+            "/var/run/himmelblaud/socket",
+            ACTIVATED_MAIN_SOCKET
+        ));
+        assert!(socket_paths_equivalent(
+            "/run/himmelblaud/task_sock/",
+            ACTIVATED_TASK_SOCKET
+        ));
+        assert!(socket_paths_equivalent(
+            "/var/run/himmelblaud/broker_sock",
+            ACTIVATED_BROKER_SOCKET
+        ));
+        assert!(!socket_paths_equivalent(
+            "/tmp/himmelblaud.sock",
+            ACTIVATED_MAIN_SOCKET
+        ));
+    }
 
     #[test]
     fn profile_photo_success_requires_zero_status() {
@@ -1855,6 +1919,21 @@ async fn main() -> ExitCode {
             // activation + FD store) in one shot, before anything
             // else consumes the LISTEN_* environment variables.
             let mut systemd_fds = prt_memfd::collect_systemd_fds();
+            release_activated_socket_unless_configured(
+                &mut systemd_fds.main_socket,
+                &socket_path,
+                ACTIVATED_MAIN_SOCKET,
+            );
+            release_activated_socket_unless_configured(
+                &mut systemd_fds.task_socket,
+                &task_socket_path,
+                ACTIVATED_TASK_SOCKET,
+            );
+            release_activated_socket_unless_configured(
+                &mut systemd_fds.broker_socket,
+                &broker_socket_path,
+                ACTIVATED_BROKER_SOCKET,
+            );
 
             // Only clean up sockets that were NOT passed via socket
             // activation, as those are owned by systemd.
@@ -1972,9 +2051,16 @@ async fn main() -> ExitCode {
                     return ExitCode::FAILURE
                 }
 
-            let (auth_value, mut hsm) = tpm_init!(cfg, return ExitCode::FAILURE);
 
-            // With the assistance of the DB, setup the HSM and its machine key.
+            // With the assistance of the DB, setup the HSM and its machine key,
+            // first checking for an existing key and then generating a new one
+            // if necessary.
+
+            let (auth_value, mut hsm) = tpm_init!(
+                cfg,
+                db.get_loadable_hsm_key(),
+                return ExitCode::FAILURE
+            );
 
             let loadable_machine_key = tpm_loadable_machine_key!(
                 db,

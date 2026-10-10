@@ -10,6 +10,7 @@
 
 use std::convert::TryFrom;
 use std::fmt;
+use std::path::Path;
 use std::time::Duration;
 
 use crate::idprovider::interface::{GroupToken, Id, UserToken};
@@ -18,7 +19,7 @@ use kanidm_lib_crypto::CryptoPolicy;
 use kanidm_lib_crypto::DbPasswordV1;
 use kanidm_lib_crypto::Password;
 use libc::umask;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use tokio::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 
@@ -151,6 +152,19 @@ pub enum DbError {
 }
 
 impl Db {
+    fn from_connection(conn: Connection) -> Self {
+        // We only build a single thread. If we need more than one, we'll
+        // need to re-do this to account for path = "" for debug.
+        let crypto_policy = CryptoPolicy::time_target(Duration::from_millis(250));
+
+        trace!("Configured {:?}", crypto_policy);
+
+        Db {
+            conn: Mutex::new(conn),
+            crypto_policy,
+        }
+    }
+
     pub fn new(path: &str) -> Result<Self, DbError> {
         let before = unsafe { umask(0o0077) };
         let conn = Connection::open(path).map_err(|e| {
@@ -158,16 +172,42 @@ impl Db {
             DbError::Sqlite
         })?;
         let _ = unsafe { umask(before) };
-        // We only build a single thread. If we need more than one, we'll
-        // need to re-do this to account for path = "" for debug.
-        let crypto_policy = CryptoPolicy::time_target(Duration::from_millis(250));
+        Ok(Self::from_connection(conn))
+    }
 
-        trace!("Configured {:?}", crypto_policy);
+    pub fn open_read_only(path: &str) -> Result<Option<Self>, DbError> {
+        match Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+            Ok(conn) => Ok(Some(Self::from_connection(conn))),
+            Err(e) => match Path::new(path).try_exists() {
+                Ok(false) => Ok(None),
+                _ => {
+                    error!(err = ?e, "rusqulite error");
+                    Err(DbError::Sqlite)
+                }
+            },
+        }
+    }
 
-        Ok(Db {
-            conn: Mutex::new(conn),
-            crypto_policy,
-        })
+    pub async fn get_loadable_hsm_key(&self) -> Result<Option<LoadableMachineKey>, CacheError> {
+        let mut dbtxn = self.write().await;
+        let initialized = dbtxn
+            .conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name = 'db_version_t'
+                )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|e| dbtxn.sqlite_error("check database initialization", &e))?;
+        let loadable_machine_key = if initialized {
+            dbtxn.get_hsm_machine_key()?
+        } else {
+            None
+        };
+        dbtxn.commit()?;
+        Ok(loadable_machine_key)
     }
 }
 
@@ -587,14 +627,13 @@ impl<'a> CacheTxn for DbTxn<'a> {
             .optional()
             .map_err(|e| self.sqlite_error("query_row", &e))?;
 
-        match data {
-            Some(d) => Ok(serde_json::from_slice(d.as_slice())
-                .map_err(|e| {
-                    error!("json error -> {:?}", e);
-                })
-                .ok()),
-            None => Ok(None),
-        }
+        data.map(|d| {
+            serde_json::from_slice(d.as_slice()).map_err(|e| {
+                error!("json error -> {:?}", e);
+                CacheError::SerdeJson
+            })
+        })
+        .transpose()
     }
 
     fn insert_hsm_machine_key(
@@ -1090,7 +1129,7 @@ impl<'a> Drop for DbTxn<'a> {
 #[cfg(test)]
 mod tests {
 
-    use super::{Cache, CacheTxn, Db, KeyStoreTxn};
+    use super::{Cache, CacheError, CacheTxn, Db, KeyStoreTxn};
     use crate::idprovider::interface::{GroupToken, Id, UserToken};
     use kanidm_hsm_crypto::{provider::BoxedDynTpm, provider::Tpm, AuthValue};
 
@@ -1107,6 +1146,31 @@ mod tests {
     fn setup_tpm() -> BoxedDynTpm {
         use kanidm_hsm_crypto::provider::SoftTpm;
         BoxedDynTpm::new(SoftTpm::new())
+    }
+
+    #[tokio::test]
+    async fn invalid_hsm_machine_key_is_not_treated_as_missing() {
+        let db = Db::new("").expect("failed to create.");
+        let mut dbtxn = db.write().await;
+        assert!(dbtxn.migrate().is_ok());
+        assert!(dbtxn
+            .conn
+            .execute(
+                "INSERT INTO hsm_int_t (key, value) VALUES ('mk', ?1)",
+                [b"invalid".as_slice()],
+            )
+            .is_ok());
+
+        assert!(matches!(
+            dbtxn.get_hsm_machine_key(),
+            Err(CacheError::SerdeJson)
+        ));
+    }
+
+    #[tokio::test]
+    async fn uninitialized_database_has_no_hsm_machine_key() {
+        let db = Db::new("").expect("failed to create.");
+        assert!(matches!(db.get_loadable_hsm_key().await, Ok(None)));
     }
 
     #[tokio::test]
