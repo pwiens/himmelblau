@@ -11,7 +11,7 @@ fn moment(seconds: u64) -> (SystemTime, Instant) {
     )
 }
 
-fn fixture() -> (Arc<AccessTokenCache>, Arc<AtomicU64>, Arc<AtomicU64>) {
+pub(super) fn fixture() -> (Arc<AccessTokenCache>, Arc<AtomicU64>, Arc<AtomicU64>) {
     let clock = Arc::new(AtomicU64::new(1000));
     let generation = Arc::new(AtomicU64::new(0));
     let now = clock.clone();
@@ -24,7 +24,7 @@ fn fixture() -> (Arc<AccessTokenCache>, Arc<AtomicU64>, Arc<AtomicU64>) {
         generation,
     )
 }
-fn issued(expiry: Option<u64>) -> Result<IssuedToken, CacheError> {
+pub(super) fn issued(expiry: Option<u64>) -> Result<IssuedToken, CacheError> {
     Ok(IssuedToken {
         response: "synthetic-fixture".to_string().into(),
         expires_at: expiry.map(moment),
@@ -345,6 +345,18 @@ async fn separate_processes_two_passes_and_restart() {
             let mut request = [0; 19];
             stream.read_exact(&mut request).await.unwrap();
             assert!(&request == b"authorized-fixture\n");
+            if shared {
+                // A different resource's fresh PRT-readiness acquisition on
+                // every client request must not evict this ADO token.
+                assert!(cache
+                    .get_or_acquire_with_policy(
+                        "uid/account/ARM-readiness".into(),
+                        true,
+                        || async { issued(Some(2000)) }
+                    )
+                    .await
+                    .is_ok());
+            }
             let acquire = || async {
                 issuances.fetch_add(1, Ordering::SeqCst);
                 issued(Some(2000))
@@ -355,13 +367,16 @@ async fn separate_processes_two_passes_and_restart() {
                     .await
                     .unwrap()
             } else {
-                Arc::new(acquire().await.unwrap().response)
+                CachedResponse::uncached(acquire().await.unwrap().response)
             };
             stream.write_all(token.as_bytes()).await.unwrap();
         }
         clients.await.unwrap();
         assert_eq!(issuances.load(Ordering::SeqCst), expected_issuances);
         assert_eq!(cache.stats().hits, expected_hits);
+        if shared {
+            assert_eq!(cache.stats().acquisitions, requests + 1);
+        }
         eprintln!("offline process simulation: requests={requests}, upstream_issuance={expected_issuances}, hits={expected_hits}");
     }
 }

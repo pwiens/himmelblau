@@ -25,6 +25,7 @@ use lru::LruCache;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use crate::access_token_cache::diagnostics::Reason;
 use crate::config::InitgroupsMode;
 use crate::constants::SERVER_CONFIG_PATH;
 use crate::db::{Cache, CacheTxn, Db};
@@ -54,6 +55,23 @@ use tokio::sync::broadcast;
 use himmelblau::auth::UserToken as UnixUserToken;
 
 const NXCACHE_SIZE: NonZeroUsize = NonZeroUsize::new(128).unwrap();
+
+fn same_authorization(a: &UserToken, b: &UserToken) -> bool {
+    let groups = |t: &UserToken| {
+        t.groups
+            .iter()
+            .map(|g| (g.uuid, g.gidnumber, g.name.clone(), g.spn.clone()))
+            .collect::<BTreeSet<_>>()
+    };
+    a.uuid == b.uuid
+        && a.tenant_id == b.tenant_id
+        && a.spn == b.spn
+        && a.name == b.name
+        && a.gidnumber == b.gidnumber
+        && a.real_gidnumber == b.real_gidnumber
+        && a.valid == b.valid
+        && groups(a) == groups(b)
+}
 
 #[allow(clippy::large_enum_variant)]
 pub enum AuthSession {
@@ -386,6 +404,122 @@ mod tests {
             tenant_id: Some(uuid::uuid!("58e8a301-2502-4814-81c5-a4d17c399a45")),
             valid: true,
         }
+    }
+
+    #[test]
+    fn account_cache_comparison_distinguishes_profile_refresh_from_authorization_change() {
+        let before = test_token();
+        let mut after = before.clone();
+        after.displayname = "New display name".into();
+        after.shell = Some("/bin/sh".into());
+        after.groups.push(after.groups[0].clone());
+        after.groups.reverse();
+        assert!(super::same_authorization(&before, &after));
+        let mut variants = Vec::new();
+        let mut t = before.clone();
+        t.valid = false;
+        variants.push(t);
+        let mut t = before.clone();
+        t.gidnumber += 1;
+        variants.push(t);
+        let mut t = before.clone();
+        t.real_gidnumber = None;
+        variants.push(t);
+        let mut t = before.clone();
+        t.uuid = uuid::Uuid::nil();
+        variants.push(t);
+        let mut t = before.clone();
+        t.tenant_id = None;
+        variants.push(t);
+        let mut t = before.clone();
+        t.spn = "other@example.test".into();
+        variants.push(t);
+        let mut t = before.clone();
+        t.name = "other".into();
+        variants.push(t);
+        let mut t = before.clone();
+        t.groups.clear();
+        variants.push(t);
+        for variant in variants {
+            assert!(!super::same_authorization(&before, &variant));
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn metadata_and_exclusion_refreshes_only_fence_actual_changes() {
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::instrument::WithSubscriber;
+        use tracing::{Event, Subscriber};
+        use tracing_subscriber::{
+            layer::{Context, SubscriberExt},
+            Layer,
+        };
+        #[derive(Default)]
+        struct Fields {
+            reason: String,
+            event: String,
+        }
+        impl Visit for Fields {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                match field.name() {
+                    "reason" => self.reason = format!("{value:?}"),
+                    "event" => self.event = format!("{value:?}"),
+                    _ => {}
+                }
+            }
+        }
+        struct Capture(Arc<Mutex<Vec<String>>>);
+        impl<S: Subscriber> Layer<S> for Capture {
+            fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+                if event.metadata().target() != crate::access_token_cache::diagnostics::TARGET {
+                    return;
+                }
+                let mut fields = Fields::default();
+                event.record(&mut fields);
+                if fields.event == "InvalidationStart" {
+                    self.0.lock().expect("logs").push(fields.reason);
+                }
+            }
+        }
+        let resolver = setup_resolver().await;
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Capture(logs.clone()));
+        async {
+            let mut token = test_token();
+            token.displayname = "Changed profile only".into();
+            resolver
+                .set_cache_usertoken(&mut token)
+                .await
+                .expect("profile refresh");
+            resolver
+                .set_cache_usertoken(&mut token)
+                .await
+                .expect("identical refresh");
+            assert!(logs.lock().expect("logs").is_empty());
+            token.valid = false;
+            resolver
+                .set_cache_usertoken(&mut token)
+                .await
+                .expect("validity change");
+            resolver
+                .set_cache_usertoken(&mut token)
+                .await
+                .expect("unchanged invalidity");
+            resolver
+                .reload_nxset(vec![("local".to_string(), 1000)].into_iter())
+                .await;
+            resolver
+                .reload_nxset(vec![("local".to_string(), 1000)].into_iter())
+                .await;
+            assert_eq!(
+                *logs.lock().expect("logs"),
+                vec!["AccountChanged", "ExclusionsChanged"]
+            );
+        }
+        .with_subscriber(subscriber)
+        .await;
     }
 
     async fn setup_resolver_with_expiry(expiry: u64) -> Resolver<OfflineFallbackProvider> {
@@ -842,7 +976,7 @@ where
     }
 
     pub async fn clear_cache(&self) -> ResolverResult<()> {
-        let _fence = crate::access_token_cache::Invalidation::new();
+        let _fence = crate::access_token_cache::Invalidation::new(Reason::ResolverClear);
         let mut nxcache_txn = self.nxcache.lock().await;
         nxcache_txn.clear();
         let mut dbtxn = self.db.write().await;
@@ -861,7 +995,7 @@ where
     }
 
     pub async fn invalidate(&self) -> ResolverResult<()> {
-        let _fence = crate::access_token_cache::Invalidation::new();
+        let _fence = crate::access_token_cache::Invalidation::new(Reason::ResolverInvalidate);
         let mut nxcache_txn = self.nxcache.lock().await;
         nxcache_txn.clear();
         let mut dbtxn = self.db.write().await;
@@ -902,9 +1036,7 @@ where
     }
 
     pub async fn reload_nxset(&self, iter: impl Iterator<Item = (String, u32)>) {
-        let _fence = crate::access_token_cache::Invalidation::new();
-        let mut nxset_txn = self.nxset.lock().await;
-        nxset_txn.clear();
+        let mut replacement = HashSet::new();
         for (name, gid) in iter {
             let name = Id::Name(name);
             let gid = Id::Gid(gid);
@@ -913,9 +1045,14 @@ where
             if !(self.allow_id_overrides.contains(&gid) || self.allow_id_overrides.contains(&name))
             {
                 trace!("Adding {:?}:{:?} to resolver exclusion set", name, gid);
-                nxset_txn.insert(name);
-                nxset_txn.insert(gid);
+                replacement.insert(name);
+                replacement.insert(gid);
             }
+        }
+        let mut nxset_txn = self.nxset.lock().await;
+        if *nxset_txn != replacement {
+            let _fence = crate::access_token_cache::Invalidation::new(Reason::ExclusionsChanged);
+            *nxset_txn = replacement;
         }
     }
 
@@ -1039,8 +1176,7 @@ where
     }
 
     async fn set_cache_usertoken(&self, token: &mut UserToken) -> ResolverResult<()> {
-        // Includes identity/validity/UID mapping replacement, not just deletion.
-        let _fence = crate::access_token_cache::Invalidation::new();
+        // Expiry/profile refresh alone is not a new authorization context.
         // Set an expiry
         let ex_time = SystemTime::now() + Duration::from_secs(self.timeout_seconds);
         let offset = ex_time
@@ -1082,6 +1218,14 @@ where
         }
 
         let mut dbtxn = self.db.write().await;
+        let old = dbtxn
+            .get_account(&Id::Name(token.spn.clone()))
+            .map_err(|_| ResolverError)?;
+        let changed = old
+            .as_ref()
+            .is_none_or(|(old, _)| !same_authorization(old, token));
+        let _fence =
+            changed.then(|| crate::access_token_cache::Invalidation::new(Reason::AccountChanged));
         token
             .groups
             .iter()
@@ -1112,7 +1256,7 @@ where
     }
 
     async fn delete_cache_usertoken(&self, a_uuid: Uuid) -> ResolverResult<()> {
-        let _fence = crate::access_token_cache::Invalidation::new();
+        let _fence = crate::access_token_cache::Invalidation::new(Reason::AccountRemoved);
         let mut dbtxn = self.db.write().await;
         dbtxn
             .delete_account(a_uuid)
@@ -1129,7 +1273,7 @@ where
     }
 
     async fn set_cache_userpassword(&self, a_uuid: Uuid, cred: &str) -> ResolverResult<()> {
-        let _fence = crate::access_token_cache::Invalidation::new();
+        let _fence = crate::access_token_cache::Invalidation::new(Reason::PasswordChanged);
         let mut dbtxn = self.db.write().await;
         let mut hsm_txn = self.hsm.lock().await;
         dbtxn
@@ -1410,7 +1554,7 @@ where
         token: &UnixUserToken,
         new_tok: &str,
     ) -> ResolverResult<bool> {
-        let _fence = crate::access_token_cache::Invalidation::new();
+        let _fence = crate::access_token_cache::Invalidation::new(Reason::PasswordChanged);
         // Validate the user isn't in the nxset (aka, it's a local user or group).
         if self.check_nxset(Some(account_id), None).await {
             return Ok(false);

@@ -1,16 +1,31 @@
-//! Conservative cache admission for the pinned provider (not a token validator
-//! for arbitrary input). Responses originate from its authenticated TLS exchange.
+//! Admission diagnostics are enums, never token/request data. MSAL uses trusted
+//! endpoint/account metadata; this provider ignores requested authority and its
+//! RT fallback can ignore client ID, so retain conservative response validation.
 use super::*;
 use himmelblau::auth::UserToken as Issued;
+use himmelblau_unix_common::access_token_cache::diagnostics::Reason;
 use serde_json::Value;
 use uuid::Uuid;
 
 pub(super) fn key(uid: uid_t, user: &UserToken, raw: &Value, protocol: &str) -> String {
-    json!([uid, user.uuid, user.tenant_id, user.spn, protocol, raw]).to_string()
+    let mut context = raw.clone();
+    // Acquisition policy isn't token identity (MSAL force_refresh semantics).
+    // Claims aren't supported for issuance; omit them ONLY to invalidate the
+    // corresponding plain request before rejecting the challenge.
+    if let Some(root) = context.as_object_mut() {
+        root.remove("claims");
+    }
+    if let Some(auth) = context
+        .get_mut("authParameters")
+        .and_then(Value::as_object_mut)
+    {
+        auth.remove("forceRefresh");
+        auth.remove("claims");
+    }
+    json!([uid, user.uuid, user.tenant_id, user.spn, protocol, context]).to_string()
 }
-
 pub(super) struct RequestPolicy {
-    pub cacheable: bool,
+    pub reason: Reason,
     pub force_refresh: bool,
     pub claims_challenge: bool,
 }
@@ -31,10 +46,22 @@ pub(super) fn request_policy(
     };
     let claims_challenge = auth.get("claims").is_some_and(|v| !v.is_null())
         || raw.get("claims").is_some_and(|v| !v.is_null());
-    // No claims/PoP/unknown extension can hit a plain bearer entry. Exact raw
-    // values (including scopes, redirect, flow fields) remain in the key.
-    let mut cacheable = known_fields(raw, &["account", "authParameters"])
-        && known_fields(
+    Ok(RequestPolicy {
+        reason: request_admission(raw, user, claims_challenge),
+        force_refresh,
+        claims_challenge,
+    })
+}
+fn request_admission(raw: &Value, user: &UserToken, claims: bool) -> Reason {
+    let auth = &raw["authParameters"];
+    if claims {
+        return Reason::ClaimsUnsupported;
+    }
+    if auth.get("popParams").is_some_and(|v| !v.is_null()) {
+        return Reason::PopUnsupported;
+    }
+    if !known_fields(raw, &["account", "authParameters"])
+        || !known_fields(
             auth,
             &[
                 "account",
@@ -48,15 +75,18 @@ pub(super) fn request_policy(
                 "forceRefresh",
             ],
         )
-        && user.tenant_id.is_some()
-        && user.valid
-        && !claims_challenge;
+    {
+        return Reason::UnknownParameter;
+    }
+    if user.tenant_id.is_none() || !user.valid {
+        return Reason::AccountUnusable;
+    }
     for account in [raw.get("account"), auth.get("account")]
         .into_iter()
         .flatten()
         .filter(|v| !v.is_null())
     {
-        cacheable &= known_fields(
+        if !known_fields(
             account,
             &[
                 "username",
@@ -65,7 +95,9 @@ pub(super) fn request_policy(
                 "realm",
                 "environment",
             ],
-        );
+        ) {
+            return Reason::UnknownParameter;
+        }
         for (field, expected) in [
             ("localAccountId", user.uuid.to_string()),
             (
@@ -82,17 +114,20 @@ pub(super) fn request_policy(
             ),
         ] {
             if let Some(value) = account.get(field) {
-                cacheable &= value.as_str() == Some(expected.as_str());
+                if value.as_str() != Some(expected.as_str()) {
+                    return Reason::AccountMetadataMismatch;
+                }
             }
         }
-        cacheable &= account["username"]
+        if !account["username"]
             .as_str()
-            .is_some_and(|name| name.to_lowercase() == user.spn.to_lowercase());
+            .is_some_and(|name| name.to_lowercase() == user.spn.to_lowercase())
+        {
+            return Reason::AccountMetadataMismatch;
+        }
     }
     if let Some(authority) = auth.get("authority") {
-        // The provider resolves its HOME tenant independently. Do not certify a
-        // requested TME/guest/cloud authority as matching that home response.
-        cacheable &= authority
+        if !authority
             .as_str()
             .and_then(|s| Url::parse(s).ok())
             .is_some_and(|url| {
@@ -104,52 +139,70 @@ pub(super) fn request_policy(
                     && url.query().is_none()
                     && url.fragment().is_none()
                     && Uuid::parse_str(url.path().trim_start_matches('/')).ok() == user.tenant_id
-            });
+            })
+        {
+            return Reason::AuthorityMismatch;
+        }
     }
-    Ok(RequestPolicy {
-        cacheable,
-        force_refresh,
-        claims_challenge,
-    })
+    Reason::Eligible
 }
-
 pub(super) fn validated_expiry(
     token: &Issued,
     user: &UserToken,
     client: Option<&str>,
     started: SystemTime,
-) -> Option<SystemTime> {
-    // Cache only identity-bound bearer results. This also excludes the pinned
-    // refresh-token fallback when it ignores an on-behalf-of client id.
-    let tenant = user.tenant_id?;
-    if !token.token_type.eq_ignore_ascii_case("bearer")
-        || Uuid::parse_str(&token.id_token.oid).ok()? != user.uuid
-        || Uuid::parse_str(&token.id_token.tid).ok()? != tenant
-        || token.expires_in == 0
-    {
-        return None;
+) -> Result<SystemTime, Reason> {
+    let tenant = user.tenant_id.ok_or(Reason::AccountUnusable)?;
+    if !token.token_type.eq_ignore_ascii_case("bearer") {
+        return Err(Reason::NonBearer);
     }
-    let access = token.access_token.as_ref()?;
-    let payload = access.split('.').nth(1)?;
-    let claims: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).ok()?).ok()?;
-    if Uuid::parse_str(claims["tid"].as_str()?).ok()? != tenant
-        || Uuid::parse_str(claims["oid"].as_str()?).ok()? != user.uuid
-    {
-        return None;
+    if Uuid::parse_str(&token.id_token.oid).map_err(|_| Reason::IdIdentityMissing)? != user.uuid {
+        return Err(Reason::IdIdentityMismatch);
     }
-    let app = claims
-        .get("azp")
-        .or_else(|| claims.get("appid"))?
-        .as_str()?;
-    if Uuid::parse_str(app).ok()? != Uuid::parse_str(client?).ok()? {
-        return None;
+    if Uuid::parse_str(&token.id_token.tid).map_err(|_| Reason::IdTenantMissing)? != tenant {
+        return Err(Reason::IdTenantMismatch);
     }
-    let jwt_expiry = UNIX_EPOCH.checked_add(Duration::from_secs(claims["exp"].as_u64()?))?;
-    // expires_in is documented seconds. Use the earlier bound, measured from
-    // BEFORE exchange (conservative), not the historically quirky expiresOn.
-    Some(jwt_expiry.min(started.checked_add(Duration::from_secs(u64::from(token.expires_in)))?))
+    if token.expires_in == 0 {
+        return Err(Reason::UnknownExpiry);
+    }
+    let payload = token
+        .access_token
+        .as_ref()
+        .and_then(|s| s.split('.').nth(1))
+        .ok_or(Reason::AccessClaimsUnreadable)?;
+    let claims: Value = serde_json::from_slice(
+        &URL_SAFE_NO_PAD
+            .decode(payload)
+            .map_err(|_| Reason::AccessClaimsUnreadable)?,
+    )
+    .map_err(|_| Reason::AccessClaimsUnreadable)?;
+    let id = |field: &str| claims[field].as_str().and_then(|s| Uuid::parse_str(s).ok());
+    if id("tid").ok_or(Reason::AccessTenantMissing)? != tenant {
+        return Err(Reason::AccessTenantMismatch);
+    }
+    if id("oid").ok_or(Reason::AccessIdentityMissing)? != user.uuid {
+        return Err(Reason::AccessIdentityMismatch);
+    }
+    let app = id(if claims.get("azp").is_some() {
+        "azp"
+    } else {
+        "appid"
+    })
+    .ok_or(Reason::ClientMissing)?;
+    if Some(app) != client.and_then(|s| Uuid::parse_str(s).ok()) {
+        return Err(Reason::ClientMismatch);
+    }
+    let jwt_expiry = UNIX_EPOCH
+        .checked_add(Duration::from_secs(
+            claims["exp"].as_u64().ok_or(Reason::JwtExpiryMissing)?,
+        ))
+        .ok_or(Reason::UnknownExpiry)?;
+    Ok(jwt_expiry.min(
+        started
+            .checked_add(Duration::from_secs(u64::from(token.expires_in)))
+            .ok_or(Reason::UnknownExpiry)?,
+    ))
 }
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -167,34 +220,66 @@ mod tests {
             "authority":"https://login.microsoftonline.com/22222222-2222-2222-2222-222222222222"}})
     }
     #[test]
-    fn admission_never_confuses_challenges_pop_unknown_or_other_tenant() {
+    fn admission_reasons_are_specific_and_unknown_context_never_hits() {
         let user = user();
-        assert!(request_policy(&request(), &user).unwrap().cacheable);
-        for (field, value) in [
-            ("claims", json!("{}")),
-            ("popParams", json!({"kid":"key"})),
-            ("unknownBinding", json!(true)),
+        assert_eq!(
+            request_policy(&request(), &user).unwrap().reason,
+            Reason::Eligible
+        );
+        for (field, value, expected) in [
+            ("claims", json!("SECRET CLAIM"), Reason::ClaimsUnsupported),
+            (
+                "popParams",
+                json!({"kid":"SECRET KEY"}),
+                Reason::PopUnsupported,
+            ),
+            ("unknownBinding", json!(true), Reason::UnknownParameter),
             (
                 "authority",
                 json!("https://login.microsoftonline.com/44444444-4444-4444-4444-444444444444"),
+                Reason::AuthorityMismatch,
             ),
             (
                 "authority",
                 json!("https://untrusted.example/22222222-2222-2222-2222-222222222222"),
+                Reason::AuthorityMismatch,
             ),
         ] {
             let mut raw = request();
             raw["authParameters"][field] = value;
-            assert!(!request_policy(&raw, &user).unwrap().cacheable);
+            assert_eq!(request_policy(&raw, &user).unwrap().reason, expected);
         }
         let mut raw = request();
-        raw["authParameters"]["forceRefresh"] = json!(true);
-        assert!(request_policy(&raw, &user).unwrap().force_refresh);
         raw["authParameters"]["forceRefresh"] = json!("true");
         assert!(request_policy(&raw, &user).is_err());
+        let mut raw = request();
+        raw["account"]["realm"] = json!("other");
+        assert_eq!(
+            request_policy(&raw, &user).unwrap().reason,
+            Reason::AccountMetadataMismatch
+        );
+        let mut invalid = user.clone();
+        invalid.valid = false;
+        assert_eq!(
+            request_policy(&request(), &invalid).unwrap().reason,
+            Reason::AccountUnusable
+        );
     }
     #[test]
-    fn exact_keys_partition_every_authorization_and_issuance_dimension() {
+    fn force_is_acquisition_policy_and_claims_only_identify_entry_for_invalidation() {
+        let user = user();
+        let raw = request();
+        let base = key(1000, &user, &raw, "1.0");
+        let mut forced = raw.clone();
+        forced["authParameters"]["forceRefresh"] = json!(true);
+        assert!(base == key(1000, &user, &forced, "1.0"));
+        assert!(request_policy(&forced, &user).unwrap().force_refresh);
+        forced["authParameters"]["claims"] = json!("SECRET CLAIM");
+        assert!(base == key(1000, &user, &forced, "1.0"));
+        assert!(request_policy(&forced, &user).unwrap().claims_challenge);
+    }
+    #[test]
+    fn exact_keys_partition_authorization_and_issuance_dimensions() {
         let user = user();
         let raw = request();
         let base = key(1000, &user, &raw, "1.0");
@@ -204,7 +289,6 @@ mod tests {
             "clientId",
             "authority",
             "requestedScopes",
-            "claims",
             "popParams",
             "redirectUri",
             "authorizationType",
@@ -223,45 +307,66 @@ mod tests {
         changed.spn = "other@example.test".into();
         assert!(base != key(1000, &changed, &raw, "1.0"));
     }
-
     #[test]
-    fn expiry_requires_matching_identity_client_and_authoritative_bounds() {
+    fn response_reasons_and_earlier_expiry_bound() {
         let user = user();
         let client = "33333333-3333-3333-3333-333333333333";
         let start = UNIX_EPOCH + Duration::from_secs(1000);
         let jwt = format!(
             "e30.{}.fixture",
             URL_SAFE_NO_PAD.encode(
-                json!({"tid":user.tenant_id,
-            "appid":client,"oid":user.uuid,"exp":1400})
-                .to_string()
+                json!({"tid":user.tenant_id,"appid":client,"oid":user.uuid,"exp":1400}).to_string()
             )
         );
-        let mut token: Issued =
-            serde_json::from_value(json!({"token_type":"Bearer","scope":"read",
-            "expires_in":600,"ext_expires_in":600,"access_token":jwt,"refresh_token":"",
-            "id_token":{"name":"Fixture","oid":user.uuid,"tid":user.tenant_id}}))
-            .unwrap();
-        assert!(
-            validated_expiry(&token, &user, Some(client), start)
-                == Some(UNIX_EPOCH + Duration::from_secs(1400))
+        let mut token: Issued = serde_json::from_value(
+            json!({"token_type":"Bearer","scope":"read","expires_in":600,
+            "ext_expires_in":600,"access_token":jwt,"refresh_token":"",
+            "id_token":{"name":"Fixture","oid":user.uuid,"tid":user.tenant_id}}),
+        )
+        .unwrap();
+        assert_eq!(
+            validated_expiry(&token, &user, Some(client), start),
+            Ok(UNIX_EPOCH + Duration::from_secs(1400))
         );
         token.expires_in = 200;
-        assert!(
-            validated_expiry(&token, &user, Some(client), start)
-                == Some(UNIX_EPOCH + Duration::from_secs(1200))
+        assert_eq!(
+            validated_expiry(&token, &user, Some(client), start),
+            Ok(UNIX_EPOCH + Duration::from_secs(1200))
         );
-        assert!(validated_expiry(
-            &token,
-            &user,
-            Some("44444444-4444-4444-4444-444444444444"),
-            start
-        )
-        .is_none());
+        assert_eq!(
+            validated_expiry(
+                &token,
+                &user,
+                Some("44444444-4444-4444-4444-444444444444"),
+                start
+            ),
+            Err(Reason::ClientMismatch)
+        );
         token.expires_in = 0;
-        assert!(validated_expiry(&token, &user, Some(client), start).is_none());
+        assert_eq!(
+            validated_expiry(&token, &user, Some(client), start),
+            Err(Reason::UnknownExpiry)
+        );
         token.expires_in = 600;
         token.access_token = Some("opaque".into());
-        assert!(validated_expiry(&token, &user, Some(client), start).is_none());
+        assert_eq!(
+            validated_expiry(&token, &user, Some(client), start),
+            Err(Reason::AccessClaimsUnreadable)
+        );
+        token.id_token.tid = Uuid::nil().to_string();
+        assert_eq!(
+            validated_expiry(&token, &user, Some(client), start),
+            Err(Reason::IdTenantMismatch)
+        );
+        token.id_token.oid = Uuid::nil().to_string();
+        assert_eq!(
+            validated_expiry(&token, &user, Some(client), start),
+            Err(Reason::IdIdentityMismatch)
+        );
+        token.token_type = "PoP".into();
+        assert_eq!(
+            validated_expiry(&token, &user, Some(client), start),
+            Err(Reason::NonBearer)
+        );
     }
 }

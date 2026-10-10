@@ -18,8 +18,11 @@
 use async_trait::async_trait;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use himmelblau_unix_common::access_token_cache::diagnostics::{
+    self, Event, Outcome, Reason, RequestLog, Stage, REQUEST_ID,
+};
 use himmelblau_unix_common::access_token_cache::{
-    access_token_generation, invalidate_access_tokens, CacheError, IssuedToken,
+    access_token_generation, invalidate_access_tokens, CacheError, CachedResponse, IssuedToken,
 };
 use himmelblau_unix_common::idprovider::himmelblau::HimmelblauMultiProvider;
 use himmelblau_unix_common::idprovider::interface::{Id, UserToken};
@@ -174,58 +177,62 @@ impl HimmelblauBroker for Broker {
         request_json: String,
         uid: uid_t,
     ) -> Result<String, Box<dyn Error>> {
-        // Bound authorization/DB/HSM waits too, including when another caller
-        // has a stuck interactive flow. Dropping this future cancels its flight.
-        tokio::time::timeout(Duration::from_secs(45), async {
-        if request_json.len() > 16 * 1024 { return Err("Token request too large".into()); }
-        let raw: serde_json::Value = serde_json::from_str(&request_json)?;
-        let request: TokenReq = serde_json::from_value(raw.clone())?;
-        // account can be at root (Firefox, Chrome) or in authParameters (Edge)
-        let account = match request.account {
-            Some(x) => x,
-            None => request.auth_parameters.account.ok_or("Missing account")?,
-        };
-        let user = self.authorized_user(&account.username, uid).await?;
-        let policy = cache::request_policy(&raw, &user)?;
-        if policy.force_refresh { invalidate_access_tokens(); }
-        if policy.claims_challenge {
-            invalidate_access_tokens();
-            // The pinned provider does not accept claims. Do not silently
-            // satisfy a challenge with an ordinary bearer token.
-            return Err("Claims challenges are not supported by this provider".into());
-        }
-        let generation = access_token_generation();
-        // Normalize and validate the redirect URI: treat empty/whitespace as
-        // None, and reject values that are not valid URIs or that contain fragments.
-        let redirect_uri = match request.auth_parameters.redirect_uri {
-            Some(ref uri) => {
-                let trimmed = uri.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    let parsed = Url::parse(trimmed).map_err(|_| "Invalid redirectUri")?;
-                    if parsed.fragment().is_some() {
-                        return Err("Invalid redirectUri: fragment not allowed".into());
-                    }
-                    Some(trimmed.to_string())
-                }
+        let mut log = RequestLog::default();
+        let result = REQUEST_ID.scope(log.id, tokio::time::timeout(Duration::from_secs(45), async {
+            if request_json.len() > 16 * 1024 { return Err("Token request too large".into()); }
+            let raw: serde_json::Value = serde_json::from_str(&request_json)?;
+            let request: TokenReq = serde_json::from_value(raw.clone())?;
+            let account = request.account.or(request.auth_parameters.account).ok_or("Missing account")?;
+            log.stage = Stage::AuthorizeBefore;
+            log.reason = Reason::AuthorizationDenied;
+            let user = self.authorized_user(&account.username, uid).await?;
+            log.stage = Stage::Admission;
+            log.reason = Reason::InvalidForceRefresh;
+            let policy = cache::request_policy(&raw, &user)?;
+            let key = cache::key(uid, &user, &raw, &protocol_version);
+            let shared = &self.cachelayer.broker_access_tokens;
+            if policy.reason != Reason::Eligible {
+                diagnostics::event(Event::Bypass, policy.reason, 0, Some(shared.stats()));
             }
-            None => None,
-        };
-        let req_cnf = build_req_cnf(&request.auth_parameters.pop_params);
-        let acquire = || async {
-            let started = SystemTime::now();
-            let started_monotonic = Instant::now();
-            let token = self.cachelayer.get_user_accesstoken(
-                Id::Name(user.spn.clone()), request.auth_parameters.requested_scopes,
-                request.auth_parameters.client_id.clone(), redirect_uri, req_cnf,
-            ).await.ok_or(CacheError::Acquisition)?;
-            let expires_at = cache::validated_expiry(&token, &user,
-                request.auth_parameters.client_id.as_deref(), started)
-                .and_then(|expiry| Some((expiry, started_monotonic.checked_add(expiry.duration_since(started).ok()?)?)));
-            let now = started.duration_since(UNIX_EPOCH).map_err(|_| CacheError::Acquisition)?;
-            let res = json!({
-                "brokerTokenResponse": {
+            if policy.claims_challenge {
+                log.reason = Reason::ClaimsUnsupported;
+                shared.invalidate_key(&key, Reason::ClaimsChallenge)?;
+                return Err("Claims challenges are not supported by this provider".into());
+            }
+            if policy.force_refresh && policy.reason != Reason::Eligible {
+                shared.invalidate_key(&key, Reason::ForcedRefresh)?;
+            }
+            let generation = access_token_generation();
+            log.reason = Reason::InvalidRedirect;
+            let redirect_uri = match request.auth_parameters.redirect_uri {
+                Some(ref uri) if !uri.trim().is_empty() => {
+                    let parsed = Url::parse(uri.trim()).map_err(|_| "Invalid redirectUri")?;
+                    if parsed.fragment().is_some() { return Err("Invalid redirectUri: fragment not allowed".into()); }
+                    Some(uri.trim().to_string())
+                }
+                _ => None,
+            };
+            let req_cnf = build_req_cnf(&request.auth_parameters.pop_params);
+            log.stage = Stage::Acquire;
+            log.reason = Reason::BackendFailure;
+            let acquire = || async {
+                let started = SystemTime::now();
+                let started_monotonic = Instant::now();
+                let token = self.cachelayer.get_user_accesstoken(
+                    Id::Name(user.spn.clone()), request.auth_parameters.requested_scopes,
+                    request.auth_parameters.client_id.clone(), redirect_uri, req_cnf,
+                ).await.ok_or(CacheError::Acquisition)?;
+                let expires_at = match cache::validated_expiry(&token, &user,
+                    request.auth_parameters.client_id.as_deref(), started) {
+                    Ok(expiry) => expiry.duration_since(started).ok()
+                        .and_then(|ttl| started_monotonic.checked_add(ttl).map(|mono| (expiry, mono))),
+                    Err(reason) => {
+                        diagnostics::event(Event::ResponseRejected, reason, 0, Some(shared.stats()));
+                        None
+                    }
+                };
+                let now = started.duration_since(UNIX_EPOCH).map_err(|_| CacheError::Acquisition)?;
+                let res = json!({"brokerTokenResponse": {
                     "accessToken": token.access_token.as_ref().ok_or(CacheError::Acquisition)?,
                     "accessTokenType": 0,
                     "clientInfo": URL_SAFE_NO_PAD.encode(json!(&token.client_info).to_string()),
@@ -233,27 +240,50 @@ impl HimmelblauBroker for Broker {
                     "extendedExpiresOn": u64::from(token.ext_expires_in) + now.as_secs(),
                     "grantedScopes": token.scope.as_ref().ok_or(CacheError::Acquisition)?,
                     "idToken": token.id_token.raw.as_ref().ok_or(CacheError::Acquisition)?,
-                }
-            });
-            Ok(IssuedToken { response: res.to_string().into(), expires_at })
-        };
-        let response = if policy.cacheable {
-            let key = cache::key(uid, &user, &raw, &protocol_version);
-            self.cachelayer.broker_access_tokens.get_or_acquire(key, acquire).await?
-        } else {
-            // Unsupported/unknown issuance context never collides with bearer
-            // cache entries. Preserve the existing provider path, bounded.
-            Arc::new(tokio::time::timeout(Duration::from_secs(40), acquire()).await
-                .map_err(|_| CacheError::Timeout)??.response)
-        };
-        let current = self.authorized_user(&account.username, uid).await?;
-        if current.uuid != user.uuid || current.tenant_id != user.tenant_id
-            || current.spn != user.spn || generation != access_token_generation() {
-            return Err(CacheError::Invalidated.into());
+                }});
+                Ok(IssuedToken { response: res.to_string().into(), expires_at })
+            };
+            let response = if policy.reason == Reason::Eligible {
+                shared.get_or_acquire_with_policy(key, policy.force_refresh, acquire).await?
+            } else {
+                CachedResponse::uncached(tokio::time::timeout(Duration::from_secs(40), acquire()).await
+                    .map_err(|_| CacheError::Timeout)??.response)
+            };
+            log.stage = Stage::AuthorizeAfter;
+            log.reason = Reason::AuthorizationDenied;
+            let current = self.authorized_user(&account.username, uid).await?;
+            if current.uuid != user.uuid || current.tenant_id != user.tenant_id
+                || current.spn != user.spn || generation != access_token_generation() {
+                return Err(CacheError::Invalidated.into());
+            }
+            // Also fence a matching forced refresh arriving during reauthorization.
+            response.validate()?;
+            log.stage = Stage::Complete;
+            Ok::<String, Box<dyn Error>>(response.as_str().to_owned())
+        })).await;
+        match result {
+            Err(_) => {
+                log.finish(Outcome::Timeout);
+                Err(CacheError::Timeout.into())
+            }
+            Ok(Ok(response)) => {
+                log.finish(Outcome::Success);
+                Ok(response)
+            }
+            Ok(Err(error)) => {
+                let outcome = match error.downcast_ref::<CacheError>() {
+                    Some(CacheError::Invalidated) => Outcome::Invalidated,
+                    Some(CacheError::Timeout) => Outcome::Timeout,
+                    Some(CacheError::Busy) => {
+                        log.reason = Reason::Capacity;
+                        Outcome::Rejected
+                    }
+                    _ => Outcome::Rejected,
+                };
+                log.finish(outcome);
+                Err(error)
+            }
         }
-        tracing::debug!(stats = ?self.cachelayer.broker_access_tokens.stats(), "broker access-token cache");
-        Ok::<String, Box<dyn Error>>(response.as_str().to_owned())
-        }).await.map_err(|_| CacheError::Timeout)?
     }
 
     async fn get_accounts(
@@ -296,7 +326,7 @@ impl HimmelblauBroker for Broker {
     ) -> Result<String, Box<dyn Error>> {
         let request: SsoCookieReq = serde_json::from_str(&request_json)?;
         self.authorized_user(&request.account.username, uid).await?;
-        invalidate_access_tokens();
+        invalidate_access_tokens(Reason::AccountRemoved);
         // Account/PRT removal is still unsupported. Do not claim logout or
         // silently delete credentials, but never retain an access-token hit.
         Err("Not implemented".into())
