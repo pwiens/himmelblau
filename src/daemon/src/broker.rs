@@ -222,6 +222,10 @@ impl HimmelblauBroker for Broker {
                     Id::Name(user.spn.clone()), request.auth_parameters.requested_scopes,
                     request.auth_parameters.client_id.clone(), redirect_uri, req_cnf,
                 ).await.ok_or(CacheError::Acquisition)?;
+                let (access, scopes, id_token) = cache::response_fields(&token).map_err(|reason| {
+                    diagnostics::event(Event::ResponseRejected, reason, 0, Some(shared.stats()));
+                    CacheError::Acquisition
+                })?;
                 let expires_at = match cache::validated_expiry(&token, &user,
                     request.auth_parameters.client_id.as_deref(), started) {
                     Ok(expiry) => expiry.duration_since(started).ok()
@@ -233,13 +237,13 @@ impl HimmelblauBroker for Broker {
                 };
                 let now = started.duration_since(UNIX_EPOCH).map_err(|_| CacheError::Acquisition)?;
                 let res = json!({"brokerTokenResponse": {
-                    "accessToken": token.access_token.as_ref().ok_or(CacheError::Acquisition)?,
+                    "accessToken": access,
                     "accessTokenType": 0,
                     "clientInfo": URL_SAFE_NO_PAD.encode(json!(&token.client_info).to_string()),
                     "expiresOn": now.as_millis() + u128::from(token.expires_in) * 1000,
                     "extendedExpiresOn": u64::from(token.ext_expires_in) + now.as_secs(),
-                    "grantedScopes": token.scope.as_ref().ok_or(CacheError::Acquisition)?,
-                    "idToken": token.id_token.raw.as_ref().ok_or(CacheError::Acquisition)?,
+                    "grantedScopes": scopes,
+                    "idToken": id_token,
                 }});
                 Ok(IssuedToken { response: res.to_string().into(), expires_at })
             };

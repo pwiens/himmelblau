@@ -146,6 +146,20 @@ fn request_admission(raw: &Value, user: &UserToken, claims: bool) -> Reason {
     }
     Reason::Eligible
 }
+pub(super) fn response_fields(token: &Issued) -> Result<(&str, &str, &str), Reason> {
+    let access = token
+        .access_token
+        .as_deref()
+        .ok_or(Reason::AccessTokenMissing)?;
+    let scope = token.scope.as_deref().ok_or(Reason::GrantedScopesMissing)?;
+    let id = token
+        .id_token
+        .raw
+        .as_deref()
+        .ok_or(Reason::RawIdTokenMissing)?;
+    Ok((access, scope, id))
+}
+
 pub(super) fn validated_expiry(
     token: &Issued,
     user: &UserToken,
@@ -324,6 +338,24 @@ mod tests {
             "id_token":{"name":"Fixture","oid":user.uuid,"tid":user.tenant_id}}),
         )
         .unwrap();
+        assert!(matches!(
+            response_fields(&token),
+            Err(Reason::RawIdTokenMissing)
+        ));
+        token.id_token.raw = Some("SYNTHETIC_ID_TOKEN".into());
+        assert!(response_fields(&token).is_ok());
+        let mut missing = token.clone();
+        missing.access_token = None;
+        assert!(matches!(
+            response_fields(&missing),
+            Err(Reason::AccessTokenMissing)
+        ));
+        let mut missing = token.clone();
+        missing.scope = None;
+        assert!(matches!(
+            response_fields(&missing),
+            Err(Reason::GrantedScopesMissing)
+        ));
         assert_eq!(
             validated_expiry(&token, &user, Some(client), start),
             Ok(UNIX_EPOCH + Duration::from_secs(1400))
