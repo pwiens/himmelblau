@@ -4,8 +4,35 @@
 use super::*;
 use himmelblau::auth::UserToken as Issued;
 use himmelblau_unix_common::access_token_cache::diagnostics::Reason;
+use himmelblau_unix_common::idprovider::interface::IdpError;
 use serde_json::Value;
 use uuid::Uuid;
+
+pub(super) fn acquisition_error(error: &IdpError) -> CacheError {
+    match error {
+        IdpError::TokenAcquisition { aadsts_code } if *aadsts_code != 0 => {
+            CacheError::Entra(*aadsts_code)
+        }
+        _ => CacheError::Acquisition,
+    }
+}
+
+/// Structured broker error, not a token response to be stored as a cache hit.
+/// Keep status unspecified rather than inventing NTSTATUS mappings. Clients
+/// can use subStatus, which contains the original structured AADSTS code.
+pub(super) fn error_response(error: CacheError) -> Option<String> {
+    match error {
+        CacheError::Entra(code) => Some(
+            json!({"brokerTokenResponse": {"error": {
+                "status": 0,
+                "subStatus": code,
+                "context": error.to_string(),
+            }}})
+            .to_string(),
+        ),
+        _ => None,
+    }
+}
 
 pub(super) fn key(uid: uid_t, user: &UserToken, raw: &Value, protocol: &str) -> String {
     let mut context = raw.clone();
@@ -233,6 +260,30 @@ mod tests {
             "clientId":"33333333-3333-3333-3333-333333333333", "requestedScopes":["resource/.default"],
             "authority":"https://login.microsoftonline.com/22222222-2222-2222-2222-222222222222"}})
     }
+    #[test]
+    fn provider_code_reaches_the_broker_error_envelope() {
+        let error = acquisition_error(&IdpError::TokenAcquisition { aadsts_code: 50196 });
+        assert_eq!(error, CacheError::Entra(50196));
+        let wire: Value = serde_json::from_str(&error_response(error).unwrap()).unwrap();
+        let response = &wire["brokerTokenResponse"];
+        assert!(response.get("accessToken").is_none());
+        assert_eq!(response["error"]["status"], 0);
+        assert_eq!(response["error"]["subStatus"], 50196);
+        assert_eq!(
+            response["error"]["context"],
+            "Entra token acquisition failed (AADSTS50196)"
+        );
+        for error in [
+            IdpError::BadRequest,
+            IdpError::Transport,
+            IdpError::TokenAcquisition { aadsts_code: 0 },
+        ] {
+            let mapped = acquisition_error(&error);
+            assert_eq!(mapped, CacheError::Acquisition);
+            assert!(error_response(mapped).is_none());
+        }
+    }
+
     #[test]
     fn admission_reasons_are_specific_and_unknown_context_never_hits() {
         let user = user();

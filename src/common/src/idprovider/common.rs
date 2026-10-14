@@ -1085,7 +1085,7 @@ macro_rules! entra_id_prt_token_fetch {
             .await
             .map_err(|e| {
                 error!("{:?}", e);
-                IdpError::BadRequest
+                $crate::idprovider::token_error::from_msal(e)
             })
     }};
 }
@@ -1138,7 +1138,7 @@ macro_rules! entra_id_refresh_token_token_fetch {
             .await
             .map_err(|e| {
                 error!("Failed to refresh token: {:?}", e);
-                IdpError::BadRequest
+                $crate::idprovider::token_error::from_msal(e)
             })
     }};
 }

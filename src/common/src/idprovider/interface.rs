@@ -38,6 +38,10 @@ pub enum IdpError {
     /// The provider made an invalid or illogical request to the idp, and a result
     /// is not able to be provided to the resolver.
     BadRequest,
+    /// A token exchange failed with a structured Entra code. Preserve only the
+    /// numeric code, never server text, tokens, URLs, or claims, for broker
+    /// clients. Other resolver operations retain their existing coarse errors.
+    TokenAcquisition { aadsts_code: u32 },
     /// The idp has indicated that the requested resource does not exist and should
     /// be considered deleted, removed, or not present.
     NotFound { what: String, where_: String },

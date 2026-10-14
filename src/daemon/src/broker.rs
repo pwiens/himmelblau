@@ -218,10 +218,10 @@ impl HimmelblauBroker for Broker {
             let acquire = || async {
                 let started = SystemTime::now();
                 let started_monotonic = Instant::now();
-                let token = self.cachelayer.get_user_accesstoken(
+                let token = self.cachelayer.get_user_accesstoken_with_error(
                     Id::Name(user.spn.clone()), request.auth_parameters.requested_scopes,
                     request.auth_parameters.client_id.clone(), redirect_uri, req_cnf,
-                ).await.ok_or(CacheError::Acquisition)?;
+                ).await.map_err(|error| cache::acquisition_error(&error))?;
                 let (access, scopes, id_token) = cache::response_fields(&token).map_err(|reason| {
                     diagnostics::event(Event::ResponseRejected, reason, 0, Some(shared.stats()));
                     CacheError::Acquisition
@@ -285,6 +285,15 @@ impl HimmelblauBroker for Broker {
                     _ => Outcome::Rejected,
                 };
                 log.finish(outcome);
+                if let Some(response) = error
+                    .downcast_ref::<CacheError>()
+                    .copied()
+                    .and_then(cache::error_response)
+                {
+                    // Keep the established broker wire envelope. This is a
+                    // rejected request, not a successful cached token response.
+                    return Ok(response);
+                }
                 Err(error)
             }
         }

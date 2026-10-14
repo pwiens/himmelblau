@@ -83,25 +83,29 @@ impl std::ops::Deref for CachedResponse {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CacheError {
     Acquisition,
+    /// Numeric provider code only; safe to share with waiters and retain during
+    /// failure backoff. Never store raw error descriptions or token material.
+    Entra(u32),
     Timeout,
     Invalidated,
     Busy,
 }
 impl std::fmt::Display for CacheError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Acquisition => "Failed to authenticate user",
-            Self::Timeout => "Access token acquisition deadline exceeded",
-            Self::Invalidated => "Access token authorization context changed",
-            Self::Busy => "Access token cache busy",
-        })
+        match self {
+            Self::Entra(code) => write!(f, "Entra token acquisition failed (AADSTS{code})"),
+            Self::Acquisition => f.write_str("Failed to authenticate user"),
+            Self::Timeout => f.write_str("Access token acquisition deadline exceeded"),
+            Self::Invalidated => f.write_str("Access token authorization context changed"),
+            Self::Busy => f.write_str("Access token cache busy"),
+        }
     }
 }
 impl std::error::Error for CacheError {}
 impl CacheError {
     fn reason(self) -> Reason {
         match self {
-            Self::Acquisition => Reason::BackendFailure,
+            Self::Acquisition | Self::Entra(_) => Reason::BackendFailure,
             Self::Timeout => Reason::AcquisitionTimeout,
             Self::Invalidated => Reason::Invalidated,
             Self::Busy => Reason::Capacity,

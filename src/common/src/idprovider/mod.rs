@@ -20,5 +20,6 @@ pub mod himmelblau;
 pub(crate) mod oidc_router;
 pub mod okta;
 pub mod openidconnect;
+pub(crate) mod token_error;
 
 pub mod interface;

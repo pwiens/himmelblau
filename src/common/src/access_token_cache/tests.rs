@@ -56,6 +56,60 @@ async fn reuse_expiry_and_unknown_expiry() {
     assert_eq!(cache.stats().acquisitions, 4);
 }
 #[tokio::test]
+async fn provider_error_survives_singleflight_and_forced_failure_backoff() {
+    let (cache, _, _) = fixture();
+    let release = Arc::new(Notify::new());
+    let started = Arc::new(Notify::new());
+    let leader = {
+        let c = cache.clone();
+        let r = release.clone();
+        let s = started.clone();
+        tokio::spawn(async move {
+            c.get_or_acquire("icm".into(), || async {
+                s.notify_one();
+                r.notified().await;
+                Err(CacheError::Entra(50196))
+            })
+            .await
+        })
+    };
+    started.notified().await;
+    let follower = {
+        let c = cache.clone();
+        tokio::spawn(async move {
+            c.get_or_acquire("icm".into(), || async { panic!("waiter must not reissue") })
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+    release.notify_one();
+    assert!(matches!(
+        leader.await.unwrap(),
+        Err(CacheError::Entra(50196))
+    ));
+    assert!(matches!(
+        follower.await.unwrap(),
+        Err(CacheError::Entra(50196))
+    ));
+    for force in [false, true] {
+        assert!(matches!(
+            cache
+                .get_or_acquire_with_policy("icm".into(), force, || async {
+                    panic!("failure backoff must not be bypassed")
+                })
+                .await,
+            Err(CacheError::Entra(50196))
+        ));
+    }
+    assert_eq!(cache.stats().acquisitions, 1);
+    assert_eq!(
+        cache.stats().stores,
+        0,
+        "an error must not become a successful token entry"
+    );
+}
+
+#[tokio::test]
 async fn wall_clock_jumps_cannot_extend_tokens_or_change_backoff() {
     let (mut cache, wall, _) = fixture();
     let mono = Arc::new(AtomicU64::new(1000));

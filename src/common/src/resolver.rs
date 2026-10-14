@@ -178,6 +178,7 @@ mod tests {
         user_get_calls: AtomicUsize,
         try_unseal_calls: AtomicUsize,
         user_get_error: AtomicUsize,
+        access_calls: AtomicUsize,
     }
 
     impl OfflineFallbackProvider {
@@ -191,6 +192,7 @@ mod tests {
                 user_get_calls: AtomicUsize::new(0),
                 try_unseal_calls: AtomicUsize::new(0),
                 user_get_error: AtomicUsize::new(0),
+                access_calls: AtomicUsize::new(0),
             }
         }
 
@@ -241,7 +243,8 @@ mod tests {
             _tpm: &mut tpm::provider::BoxedDynTpm,
             _machine_key: &tpm::structures::StorageKey,
         ) -> Result<UnixUserToken, IdpError> {
-            Err(IdpError::BadRequest)
+            self.access_calls.fetch_add(1, Ordering::AcqRel);
+            Err(IdpError::TokenAcquisition { aadsts_code: 50196 })
         }
 
         async fn unix_user_tgts<D: KeyStoreTxn + Send>(
@@ -577,6 +580,39 @@ mod tests {
 
     async fn setup_resolver() -> Resolver<OfflineFallbackProvider> {
         setup_resolver_with_expiry(0).await
+    }
+
+    #[tokio::test]
+    async fn token_error_survives_resolver_without_changing_legacy_or_exclusion_behavior() {
+        let resolver = setup_resolver().await;
+        let account = Id::Name("testuser@example.com".into());
+        let error = resolver
+            .get_user_accesstoken_with_error(account.clone(), vec![], None, None, None)
+            .await;
+        assert!(matches!(
+            error,
+            Err(IdpError::TokenAcquisition { aadsts_code: 50196 })
+        ));
+        assert!(resolver
+            .get_user_accesstoken(account.clone(), vec![], None, None, None)
+            .await
+            .is_none());
+        assert_eq!(resolver.client.access_calls.load(Ordering::Acquire), 2);
+
+        resolver
+            .reload_nxset(vec![("testuser@example.com".into(), 1000)].into_iter())
+            .await;
+        assert!(matches!(
+            resolver
+                .get_user_accesstoken_with_error(account, vec![], None, None, None,)
+                .await,
+            Err(IdpError::BadRequest)
+        ));
+        assert_eq!(
+            resolver.client.access_calls.load(Ordering::Acquire),
+            2,
+            "excluded caller must not reach the provider"
+        );
     }
 
     #[tokio::test]
@@ -1388,20 +1424,35 @@ where
         redirect_uri: Option<String>,
         req_cnf: Option<String>,
     ) -> Option<UnixUserToken> {
+        self.get_user_accesstoken_with_error(account_id, scopes, client_id, redirect_uri, req_cnf)
+            .await
+            .ok()
+    }
+
+    /// Broker-only result path: preserve provider codes through the same
+    /// authorization, HSM, and transaction checks as the legacy Option API.
+    pub async fn get_user_accesstoken_with_error(
+        &self,
+        account_id: Id,
+        scopes: Vec<String>,
+        client_id: Option<String>,
+        redirect_uri: Option<String>,
+        req_cnf: Option<String>,
+    ) -> Result<UnixUserToken, IdpError> {
         // Validate the user isn't in the nxset (aka, it's a local user or group).
         let (name, idnumber) = match account_id.clone() {
             Id::Name(name) => (Some(name), None),
             Id::Gid(idnumber) => (None, Some(idnumber)),
         };
         if self.check_nxset(name.as_deref(), idnumber).await {
-            return None;
+            return Err(IdpError::BadRequest);
         }
 
         let token = match self.get_usertoken(account_id.clone()).await {
             Ok(Some(token)) => token,
             _ => {
                 error!("Failed to fetch unix user token during access token request!");
-                return None;
+                return Err(IdpError::BadRequest);
             }
         };
 
@@ -1426,16 +1477,13 @@ where
         drop(hsm_lock);
         if dbtxn.commit().is_err() {
             error!("Failed to commit user token DB transaction");
-            return None;
+            return Err(IdpError::KeyStore);
         }
 
-        match user_get_result {
-            Ok(token) => Some(token),
-            Err(e) => {
-                error!("Failed to fetch access token: {:?}", e);
-                None
-            }
+        if let Err(ref error) = user_get_result {
+            error!("Failed to fetch access token: {:?}", error);
         }
+        user_get_result
     }
 
     pub async fn get_user_tgts(

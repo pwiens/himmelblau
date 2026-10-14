@@ -67,7 +67,7 @@ pub(super) fn local_error(operation: &'static str, error: &IdpError) {
             reason = "keystore",
             "Okta local credential operation failed"
         ),
-        IdpError::BadRequest => debug!(
+        IdpError::BadRequest | IdpError::TokenAcquisition { .. } => debug!(
             operation,
             reason = "bad_request",
             "Okta authentication operation failed"
